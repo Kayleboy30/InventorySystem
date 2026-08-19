@@ -1,0 +1,58 @@
+name: Apply recent transactions fix
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch Code.js
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Code.js')
+          s = p.read_text()
+          old = """  const allTransactions = [...incoming.transactions, ...outgoing.transactions];
+  allTransactions.sort((a, b) => b.rawDate - a.rawDate);"""
+          new = """  const allTransactions = [...incoming.transactions, ...outgoing.transactions];
+
+  // Always sort Incoming + Outgoing by the actual transaction date.
+  // rawDate is preferred, with a safe fallback to the displayed M/D/YYYY date.
+  const transactionTimestamp = (t) => {
+    const raw = Number(t && t.rawDate);
+    if (Number.isFinite(raw) && raw > 0) return raw;
+
+    const value = String((t && t.date) || '').trim();
+    const parts = value.split(/[\\/\\-]/).map(Number);
+    if (parts.length === 3 && parts.every(Number.isFinite)) {
+      let month, day, year;
+      if (parts[0] > 31) {
+        year = parts[0]; day = parts[1]; month = parts[2];
+      } else {
+        month = parts[0]; day = parts[1]; year = parts[2];
+      }
+      if (year < 100) year += 2000;
+      const d = new Date(year, month - 1, day);
+      if (!isNaN(d.getTime())) return d.getTime();
+    }
+    return 0;
+  };
+
+  allTransactions.forEach(t => { t.rawDate = transactionTimestamp(t); });
+  allTransactions.sort((a, b) => b.rawDate - a.rawDate);"""
+          if old not in s:
+              raise SystemExit('Target block not found; no changes made.')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Commit and push fix, then remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/apply-recent-transactions-fix.yml
+          git add Code.js .github/workflows/apply-recent-transactions-fix.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix incoming and outgoing recent transaction sorting"
+          git push origin main
