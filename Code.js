@@ -36,8 +36,18 @@ function getDashboardData() {
     return { key: mat.key, name: mat.name, inQty, outQty, stock, isLow: stock <= 2000 };
   });
 
-  const allTransactions = [...incoming.transactions, ...outgoing.transactions];
-  allTransactions.sort((a, b) => b.rawDate - a.rawDate);
+  // Combine Incoming + Outgoing transactions
+    const allTransactions = [
+    ...incoming.transactions,
+    ...outgoing.transactions
+  ];
+
+  // Sort by:
+  // 1. Latest date first
+  // 2. If same date, latest encoded row first
+  allTransactions.sort((a, b) => {
+    return (b.rowIndex || 0) - (a.rowIndex || 0);
+  });
 
   return {
     materials: MATERIAL_COLUMNS,
