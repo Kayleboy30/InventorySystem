@@ -48,130 +48,529 @@ function fetchIncomingData() {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(SHEET_NAMES.INCOMING);
-    if (!sheet) return { totals: {}, monthlyIncoming: {}, transactions: [], pastRecords: [] };
+
+    if (!sheet) {
+      return {
+        totals: {},
+        monthlyIncoming: {},
+        transactions: [],
+        pastRecords: []
+      };
+    }
 
     const data = sheet.getDataRange().getValues();
-    if (data.length <= 1) return { totals: {}, monthlyIncoming: {}, transactions: [], pastRecords: [] };
 
+    if (data.length <= 1) {
+      const emptyTotals = {};
+      MATERIAL_COLUMNS.forEach(mat => emptyTotals[mat.key] = 0);
+
+      return {
+        totals: emptyTotals,
+        monthlyIncoming: {},
+        transactions: [],
+        pastRecords: []
+      };
+    }
+
+    // ============================================================
+    // READ HEADER ROW
+    // ============================================================
+    const headers = data[0].map(h =>
+      String(h || '').trim().toLowerCase()
+    );
+
+    // ============================================================
+    // FIND MATERIAL COLUMNS BY HEADER NAME
+    // This prevents Desk Calendar from receiving another item's value
+    // ============================================================
+    const materialColumnMap = {};
+
+    MATERIAL_COLUMNS.forEach(mat => {
+      const key = mat.key.toLowerCase().trim();
+      const name = mat.name.toLowerCase().trim();
+
+      let columnIndex = headers.findIndex(h => h === key);
+
+      // If key is not found, also try the full material name
+      if (columnIndex === -1) {
+        columnIndex = headers.findIndex(h => h === name);
+      }
+
+      // Store the actual spreadsheet column
+      materialColumnMap[mat.key] = columnIndex;
+    });
+
+    // ============================================================
+    // INITIALIZE TOTALS
+    // ============================================================
     const totals = {};
-    MATERIAL_COLUMNS.forEach(m => totals[m.key] = 0);
+
+    MATERIAL_COLUMNS.forEach(mat => {
+      totals[mat.key] = 0;
+    });
 
     const monthlyIncoming = {};
     const transactions = [];
     const pastRecords = [];
 
-    // Col 0: ID, Col 1: Date, Col 2: Supplier, Cols 3-15: 13 Materials, Col 16: DR #
+    // ============================================================
+    // FIND GENERAL COLUMNS
+    // ============================================================
+    const idCol = headers.findIndex(h => h === 'id');
+
+    const dateCol = headers.findIndex(h =>
+      h === 'date'
+    );
+
+    const supplierCol = headers.findIndex(h =>
+      h === 'supplier' ||
+      h === 'supplier name' ||
+      h === 'party'
+    );
+
+    const drCol = headers.findIndex(h =>
+      h === 'dr #' ||
+      h === 'dr no' ||
+      h === 'dr number' ||
+      h === 'dr' ||
+      h.includes('delivery receipt')
+    );
+
+    // ============================================================
+    // PROCESS EACH INCOMING RECORD
+    // ============================================================
     for (let i = 1; i < data.length; i++) {
+
       const row = data[i];
-      const rawDate = row[1];
+
+      // ----------------------------------------------------------
+      // DATE
+      // ----------------------------------------------------------
+      const rawDate =
+        dateCol !== -1
+          ? row[dateCol]
+          : row[1];
+
       if (!rawDate) continue;
 
       const dateObj = new Date(rawDate);
-      const formattedDate = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-      const monthKey = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), 'MMM yy');
 
+      if (isNaN(dateObj.getTime())) continue;
+
+      const formattedDate = Utilities.formatDate(
+        dateObj,
+        Session.getScriptTimeZone(),
+        'M/d/yyyy'
+      );
+
+      const monthKey = Utilities.formatDate(
+        dateObj,
+        Session.getScriptTimeZone(),
+        'MMM yy'
+      );
+
+      // ----------------------------------------------------------
+      // CREATE MONTH ENTRY
+      // ----------------------------------------------------------
       if (!monthlyIncoming[monthKey]) {
         monthlyIncoming[monthKey] = {};
-        MATERIAL_COLUMNS.forEach(m => monthlyIncoming[monthKey][m.key] = 0);
+
+        MATERIAL_COLUMNS.forEach(mat => {
+          monthlyIncoming[monthKey][mat.key] = 0;
+        });
       }
 
-      const supplierName = String(row[2] || '-').trim();
-      const drNum = String(row[16] || row[row.length - 1] || '-').trim();
+      // ----------------------------------------------------------
+      // SUPPLIER
+      // ----------------------------------------------------------
+      const supplierName =
+        supplierCol !== -1
+          ? String(row[supplierCol] || '-').trim()
+          : String(row[2] || '-').trim();
 
+      // ----------------------------------------------------------
+      // DR NUMBER
+      // ----------------------------------------------------------
+      let drNum = '-';
+
+      if (drCol !== -1) {
+        drNum = String(row[drCol] || '-').trim();
+      } else {
+        drNum = String(row[row.length - 1] || '-').trim();
+      }
+
+      // ----------------------------------------------------------
+      // MATERIAL QUANTITIES
+      // ----------------------------------------------------------
       const recordItems = {};
 
-      MATERIAL_COLUMNS.forEach((mat, idx) => {
-        const val = Number(row[3 + idx]) || 0;
-        totals[mat.key] += val;
-        monthlyIncoming[monthKey][mat.key] += val;
+      MATERIAL_COLUMNS.forEach(mat => {
+
+        const columnIndex = materialColumnMap[mat.key];
+
+        let val = 0;
+
+        // Only read the column if the material was actually found
+        if (columnIndex !== -1) {
+          val = Number(row[columnIndex]) || 0;
+        }
+
+        // Store the quantity under the CORRECT material key
         recordItems[mat.key] = val;
+
+        // Add to total
+        totals[mat.key] += val;
+
+        // Add to monthly total
+        monthlyIncoming[monthKey][mat.key] += val;
       });
 
+      // ----------------------------------------------------------
+      // TRANSACTION
+      // ----------------------------------------------------------
       transactions.push({
         type: 'Incoming',
         date: formattedDate,
         rawDate: dateObj.getTime(),
+
+        // Spreadsheet row = encoding order
+        rowIndex: i + 1,
+
         party: supplierName,
         ref: drNum !== '-' ? drNum : 'N/A'
       });
 
+      // ----------------------------------------------------------
+      // PAST RECORD
+      // ----------------------------------------------------------
       pastRecords.push({
         id: i + 1,
-        recordId: row[0] || ('INC-' + (i + 1)),
+
+        recordId:
+          idCol !== -1 && row[idCol]
+            ? row[idCol]
+            : ('INC-' + (i + 1)),
+
         date: formattedDate,
+
         supplier: supplierName,
-        drNumber: drNum !== '-' ? drNum : '',
+
+        drNumber:
+          drNum !== '-'
+            ? drNum
+            : '',
+
         items: recordItems
       });
     }
 
+    // Newest records first
     pastRecords.reverse();
 
+    // ============================================================
+    // RETURN DATA
+    // ============================================================
     return {
       totals: totals,
       monthlyIncoming: monthlyIncoming,
       transactions: transactions,
       pastRecords: pastRecords
     };
+
   } catch (err) {
-    return { totals: {}, monthlyIncoming: {}, transactions: [], pastRecords: [], error: err.message };
+
+    console.error(
+      'fetchIncomingData error:',
+      err
+    );
+
+    return {
+      totals: {},
+      monthlyIncoming: {},
+      transactions: [],
+      pastRecords: [],
+      error: err.message
+    };
   }
 }
 
 function recordIncoming(formData) {
   try {
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(SHEET_NAMES.INCOMING);
-    if (!sheet) throw new Error('Sheet ' + SHEET_NAMES.INCOMING + ' not found.');
 
-    const newId = 'INC-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
-    const dateVal = formData.date ? new Date(formData.date) : new Date();
+    if (!sheet) {
+      throw new Error(
+        'Sheet ' + SHEET_NAMES.INCOMING + ' not found.'
+      );
+    }
 
-    const rowData = [
-      newId,
-      dateVal,
-      formData.party || ''
-    ];
+    // ============================================================
+    // READ SHEET HEADERS
+    // ============================================================
+    const headers = sheet
+      .getRange(1, 1, 1, sheet.getLastColumn())
+      .getValues()[0]
+      .map(h => String(h || '').trim());
 
-    MATERIAL_COLUMNS.forEach(mat => {
-      const qty = (formData.items && formData.items[mat.key]) ? Number(formData.items[mat.key]) : 0;
-      rowData.push(qty);
+    const newRow = new Array(headers.length).fill('');
+
+    // ============================================================
+    // CREATE ID
+    // ============================================================
+    const newId =
+      'INC-' +
+      Utilities.formatDate(
+        new Date(),
+        Session.getScriptTimeZone(),
+        'yyyyMMdd-HHmmss'
+      );
+
+    // ============================================================
+    // WRITE DATA BASED ON HEADER NAME
+    // ============================================================
+    headers.forEach((header, index) => {
+
+      const h = header.toLowerCase().trim();
+
+      // ID
+      if (h === 'id') {
+
+        newRow[index] = newId;
+
+      }
+
+      // DATE
+      else if (h === 'date') {
+
+        newRow[index] =
+          formData.date
+            ? new Date(formData.date)
+            : new Date();
+
+      }
+
+      // SUPPLIER
+      else if (
+        h === 'supplier' ||
+        h === 'supplier name' ||
+        h === 'party'
+      ) {
+
+        newRow[index] =
+          formData.party || '';
+
+      }
+
+      // DR NUMBER
+      else if (
+        h === 'dr #' ||
+        h === 'dr no' ||
+        h === 'dr number' ||
+        h === 'dr' ||
+        h.includes('delivery receipt')
+      ) {
+
+        newRow[index] =
+          formData.drNumber || '';
+
+      }
+
+      // ==========================================================
+      // MATERIAL
+      // ==========================================================
+      else {
+
+        const material = MATERIAL_COLUMNS.find(mat => {
+
+          return (
+            mat.key.toLowerCase().trim() === h ||
+            mat.name.toLowerCase().trim() === h
+          );
+
+        });
+
+        if (material) {
+
+          const qty =
+            formData.items &&
+            formData.items[material.key]
+              ? Number(formData.items[material.key])
+              : 0;
+
+          newRow[index] = qty;
+        }
+      }
     });
 
-    rowData.push(formData.drNumber || '');
+    // ============================================================
+    // SAVE ROW
+    // ============================================================
+    sheet.appendRow(newRow);
 
-    sheet.appendRow(rowData);
-    return { success: true, id: newId };
+    return {
+      success: true,
+      id: newId
+    };
+
   } catch (err) {
-    return { success: false, error: err.message };
+
+    console.error(
+      'recordIncoming error:',
+      err
+    );
+
+    return {
+      success: false,
+      error: err.message
+    };
   }
 }
 
 function updateIncoming(rowIndex, formData) {
   try {
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName(SHEET_NAMES.INCOMING);
-    if (!sheet) throw new Error('Sheet ' + SHEET_NAMES.INCOMING + ' not found.');
 
-    const existingId = sheet.getRange(rowIndex, 1).getValue() || ('INC-' + rowIndex);
-    const dateVal = formData.date ? new Date(formData.date) : new Date();
+    if (!sheet) {
+      throw new Error(
+        'Sheet ' + SHEET_NAMES.INCOMING + ' not found.'
+      );
+    }
 
-    const rowData = [
-      existingId,
-      dateVal,
-      formData.party || ''
-    ];
+    // ============================================================
+    // READ HEADERS
+    // ============================================================
+    const headers = sheet
+      .getRange(1, 1, 1, sheet.getLastColumn())
+      .getValues()[0]
+      .map(h => String(h || '').trim());
 
-    MATERIAL_COLUMNS.forEach(mat => {
-      const qty = (formData.items && formData.items[mat.key]) ? Number(formData.items[mat.key]) : 0;
-      rowData.push(qty);
+    // ============================================================
+    // GET EXISTING ROW
+    // ============================================================
+    const existingRow = sheet
+      .getRange(
+        rowIndex,
+        1,
+        1,
+        headers.length
+      )
+      .getValues()[0];
+
+    const updatedRow = existingRow.slice();
+
+    // ============================================================
+    // UPDATE BASED ON HEADER
+    // ============================================================
+    headers.forEach((header, index) => {
+
+      const h = header.toLowerCase().trim();
+
+      // ----------------------------------------------------------
+      // ID
+      // ----------------------------------------------------------
+      if (h === 'id') {
+        // Keep existing ID
+      }
+
+      // ----------------------------------------------------------
+      // DATE
+      // ----------------------------------------------------------
+      else if (h === 'date') {
+
+        updatedRow[index] =
+          formData.date
+            ? new Date(formData.date)
+            : new Date();
+
+      }
+
+      // ----------------------------------------------------------
+      // SUPPLIER
+      // ----------------------------------------------------------
+      else if (
+        h === 'supplier' ||
+        h === 'supplier name' ||
+        h === 'party'
+      ) {
+
+        updatedRow[index] =
+          formData.party || '';
+
+      }
+
+      // ----------------------------------------------------------
+      // DR NUMBER
+      // ----------------------------------------------------------
+      else if (
+        h === 'dr #' ||
+        h === 'dr no' ||
+        h === 'dr number' ||
+        h === 'dr' ||
+        h.includes('delivery receipt')
+      ) {
+
+        updatedRow[index] =
+          formData.drNumber || '';
+
+      }
+
+      // ----------------------------------------------------------
+      // MATERIAL
+      // ----------------------------------------------------------
+      else {
+
+        const material = MATERIAL_COLUMNS.find(mat => {
+
+          return (
+            mat.key.toLowerCase().trim() === h ||
+            mat.name.toLowerCase().trim() === h
+          );
+
+        });
+
+        if (material) {
+
+          const qty =
+            formData.items &&
+            formData.items[material.key]
+              ? Number(formData.items[material.key])
+              : 0;
+
+          updatedRow[index] = qty;
+        }
+      }
     });
 
-    rowData.push(formData.drNumber || '');
+    // ============================================================
+    // SAVE
+    // ============================================================
+    sheet
+      .getRange(
+        rowIndex,
+        1,
+        1,
+        headers.length
+      )
+      .setValues([updatedRow]);
 
-    sheet.getRange(rowIndex, 1, 1, rowData.length).setValues([rowData]);
-    return { success: true, id: existingId };
+    return {
+      success: true
+    };
+
   } catch (err) {
-    return { success: false, error: err.message };
+
+    console.error(
+      'updateIncoming error:',
+      err
+    );
+
+    return {
+      success: false,
+      error: err.message
+    };
   }
 }
