@@ -138,9 +138,6 @@ function fetchAvpDatabase() {
   return { avpDirectory, avpList: avpList.sort() };
 }
 
-/**
- * Reads all outgoing rows including material quantities for past records
- */
 function fetchOutgoingData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const outSheet = ss.getSheetByName(SHEET_NAMES.OUTGOING);
@@ -150,99 +147,371 @@ function fetchOutgoingData() {
   const transactions = [];
   const pastRecords = [];
 
-  MATERIAL_COLUMNS.forEach(mat => { totals[mat.key] = 0; });
+  MATERIAL_COLUMNS.forEach(mat => {
+    totals[mat.key] = 0;
+  });
 
   if (!outSheet || outSheet.getLastRow() <= 1) {
-    return { totals, monthlyOutgoing, transactions, pastRecords };
+    return {
+      totals,
+      monthlyOutgoing,
+      transactions,
+      pastRecords
+    };
   }
 
   const values = outSheet.getDataRange().getValues();
   const headers = values[0].map(h => String(h).trim());
 
-  const dateIdx    = headers.findIndex(h => h.toLowerCase() === 'date');
-  const avpIdx     = headers.findIndex(h => h.toLowerCase() === 'avp name' || h.toLowerCase() === 'avp');
-  const divIdx     = headers.findIndex(h => h.toLowerCase() === 'division');
-  const destIdx    = headers.findIndex(h => h.toLowerCase() === 'destination');
-  const controlIdx = headers.findIndex(h => h.toLowerCase().includes('control'));
-  const regIdx     = headers.findIndex(h => h.toLowerCase().includes('region') || 
-                      (h.toLowerCase().includes('cluster') && !h.toLowerCase().includes('head')));
-  const opIdx      = headers.findIndex(h => h.toLowerCase() === 'operation');
-  const headIdx    = headers.findIndex(h => h.toLowerCase() === 'cluster head');
-  const contactIdx = headers.findIndex(h => h.toLowerCase().includes('head contact') || h.toLowerCase().includes('contact'));
-  const baseIdx    = headers.findIndex(h => h.toLowerCase() === 'base station' || h.toLowerCase().includes('base'));
-  const notesIdx   = headers.findIndex(h => h.toLowerCase() === 'notes');
+  const dateIdx = headers.findIndex(
+    h => h.toLowerCase() === 'date'
+  );
+
+  const avpIdx = headers.findIndex(
+    h =>
+      h.toLowerCase() === 'avp name' ||
+      h.toLowerCase() === 'avp'
+  );
+
+  const divIdx = headers.findIndex(
+    h => h.toLowerCase() === 'division'
+  );
+
+  const destIdx = headers.findIndex(
+    h => h.toLowerCase() === 'destination'
+  );
+
+  const controlIdx = headers.findIndex(
+    h => h.toLowerCase().includes('control')
+  );
+
+  const regIdx = headers.findIndex(
+    h =>
+      h.toLowerCase().includes('region') ||
+      (
+        h.toLowerCase().includes('cluster') &&
+        !h.toLowerCase().includes('head')
+      )
+  );
+
+  const opIdx = headers.findIndex(
+    h => h.toLowerCase() === 'operation'
+  );
+
+  const headIdx = headers.findIndex(
+    h => h.toLowerCase() === 'cluster head'
+  );
+
+  const contactIdx = headers.findIndex(
+    h =>
+      h.toLowerCase().includes('head contact') ||
+      h.toLowerCase().includes('contact')
+  );
+
+  const baseIdx = headers.findIndex(
+    h =>
+      h.toLowerCase() === 'base station' ||
+      h.toLowerCase().includes('base')
+  );
+
+  const notesIdx = headers.findIndex(
+    h => h.toLowerCase() === 'notes'
+  );
+
+
+  // ============================================================
+  // DATE PARSER
+  // Handles Google Sheets Date objects and date strings
+  // ============================================================
+  function parseTransactionDate(value) {
+
+    if (!value) {
+      return null;
+    }
+
+    // Google Sheets Date object
+    if (Object.prototype.toString.call(value) === '[object Date]') {
+      if (!isNaN(value.getTime())) {
+        return value;
+      }
+    }
+
+    // String date
+    const str = String(value).trim();
+
+    if (!str) {
+      return null;
+    }
+
+    // MM/DD/YYYY
+    const match = str.match(
+      /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/
+    );
+
+    if (match) {
+      const month = Number(match[1]);
+      const day = Number(match[2]);
+      const year = Number(match[3]);
+
+      const date = new Date(
+        year,
+        month - 1,
+        day
+      );
+
+      if (!isNaN(date.getTime())) {
+        return date;
+      }
+    }
+
+    // Fallback
+    const parsed = new Date(str);
+
+    if (!isNaN(parsed.getTime())) {
+      return parsed;
+    }
+
+    return null;
+  }
+
+
+  // ============================================================
+  // READ ALL OUTGOING RECORDS
+  // ============================================================
 
   for (let r = 1; r < values.length; r++) {
+
     const row = values[r];
 
-    const dateVal    = dateIdx    !== -1 ? row[dateIdx]    : null;
-    const monthStr   = formatDateMonth(dateVal);
-    const avpVal     = avpIdx     !== -1 && row[avpIdx]     ? String(row[avpIdx]).trim()     : '-';
-    const divVal     = divIdx     !== -1 && row[divIdx]     ? String(row[divIdx]).trim()     : '-';
-    const destVal    = destIdx    !== -1 && row[destIdx]    ? String(row[destIdx]).trim()    : '-';
-    const controlVal = controlIdx !== -1 && row[controlIdx] ? String(row[controlIdx]).trim() : '-';
-    const regVal     = regIdx     !== -1 && row[regIdx]     ? String(row[regIdx]).trim()     : '-';
-    const opVal      = opIdx      !== -1 && row[opIdx]      ? String(row[opIdx]).trim()      : '';
-    const headVal    = headIdx    !== -1 && row[headIdx]    ? String(row[headIdx]).trim()    : '';
-    const contactVal = contactIdx !== -1 && row[contactIdx] ? String(row[contactIdx]).trim() : '';
-    const baseVal    = baseIdx    !== -1 && row[baseIdx]    ? String(row[baseIdx]).trim()    : '';
-    const notesVal   = notesIdx   !== -1 && row[notesIdx]   ? String(row[notesIdx]).trim()   : '';
+    const dateVal =
+      dateIdx !== -1
+        ? row[dateIdx]
+        : null;
+
+    const transactionDate =
+      parseTransactionDate(dateVal);
+
+    const rawDate =
+      transactionDate
+        ? transactionDate.getTime()
+        : 0;
+
+
+    const monthStr =
+      transactionDate
+        ? Utilities.formatDate(
+            transactionDate,
+            Session.getScriptTimeZone(),
+            'MMM yy'
+          )
+        : '';
+
+
+    const avpVal =
+      avpIdx !== -1 && row[avpIdx]
+        ? String(row[avpIdx]).trim()
+        : '-';
+
+    const divVal =
+      divIdx !== -1 && row[divIdx]
+        ? String(row[divIdx]).trim()
+        : '-';
+
+    const destVal =
+      destIdx !== -1 && row[destIdx]
+        ? String(row[destIdx]).trim()
+        : '-';
+
+    const controlVal =
+      controlIdx !== -1 && row[controlIdx]
+        ? String(row[controlIdx]).trim()
+        : '-';
+
+    const regVal =
+      regIdx !== -1 && row[regIdx]
+        ? String(row[regIdx]).trim()
+        : '-';
+
+    const opVal =
+      opIdx !== -1 && row[opIdx]
+        ? String(row[opIdx]).trim()
+        : '';
+
+    const headVal =
+      headIdx !== -1 && row[headIdx]
+        ? String(row[headIdx]).trim()
+        : '';
+
+    const contactVal =
+      contactIdx !== -1 && row[contactIdx]
+        ? String(row[contactIdx]).trim()
+        : '';
+
+    const baseVal =
+      baseIdx !== -1 && row[baseIdx]
+        ? String(row[baseIdx]).trim()
+        : '';
+
+    const notesVal =
+      notesIdx !== -1 && row[notesIdx]
+        ? String(row[notesIdx]).trim()
+        : '';
+
+
+    // ============================================================
+    // MATERIAL QUANTITIES
+    // ============================================================
 
     const itemQuantities = {};
     let rowHasData = false;
 
     MATERIAL_COLUMNS.forEach(mat => {
-      const colIdx = headers.findIndex(h => h.toLowerCase() === mat.key.toLowerCase());
+
+      const colIdx =
+        headers.findIndex(
+          h =>
+            h.toLowerCase() ===
+            mat.key.toLowerCase()
+        );
+
       if (colIdx !== -1) {
-        const qty = parseFloat(row[colIdx]) || 0;
+
+        const qty =
+          parseFloat(row[colIdx]) || 0;
+
         if (qty > 0) {
+
           rowHasData = true;
+
           itemQuantities[mat.key] = qty;
+
           totals[mat.key] += qty;
 
+
           if (monthStr) {
-            if (!monthlyOutgoing[monthStr]) monthlyOutgoing[monthStr] = {};
-            if (!monthlyOutgoing[monthStr][mat.key]) monthlyOutgoing[monthStr][mat.key] = 0;
+
+            if (!monthlyOutgoing[monthStr]) {
+              monthlyOutgoing[monthStr] = {};
+            }
+
+            if (!monthlyOutgoing[monthStr][mat.key]) {
+              monthlyOutgoing[monthStr][mat.key] = 0;
+            }
+
             monthlyOutgoing[monthStr][mat.key] += qty;
           }
         }
       }
     });
 
+
+    // ============================================================
+    // ADD TRANSACTION
+    // ============================================================
+
     if (rowHasData) {
-      const dateString = dateVal ? new Date(dateVal).toLocaleDateString() : 'N/A';
+
+      const dateString =
+        transactionDate
+          ? Utilities.formatDate(
+              transactionDate,
+              Session.getScriptTimeZone(),
+              'M/d/yyyy'
+            )
+          : 'N/A';
+
 
       transactions.push({
-        type: 'Outgoing',
-        date: dateString,
-        party: `${destVal} (${avpVal})`.trim(),
-        ref: controlVal,
-        rawDate: dateVal ? new Date(dateVal).getTime() : 0
+          type: 'Outgoing',
+          date: dateString,
+          party: `${destVal} (${avpVal})`.trim(),
+          ref: controlVal,
+
+          // Date shown in dashboard
+          rawDate: rawDate,
+
+          // Actual encoding order
+          rowIndex: r + 1
       });
 
+
       pastRecords.push({
+
         id: r,
+
         date: dateString,
+
         controlNo: controlVal,
+
         avpName: avpVal,
+
         division: divVal,
+
         destination: destVal,
+
         cluster: regVal,
+
         operation: opVal,
+
         clusterHead: headVal,
+
         clusterHeadContact: contactVal,
+
         baseStation: baseVal,
+
         notes: notesVal,
+
         items: itemQuantities,
-        rawDate: dateVal ? new Date(dateVal).getTime() : 0
+
+        rawDate: rawDate,
+
+        rowIndex: r + 1
       });
     }
   }
 
-  pastRecords.sort((a, b) => b.rawDate - a.rawDate);
 
-  return { totals, monthlyOutgoing, transactions, pastRecords };
+  // ============================================================
+  // SORT PAST OUTGOING RECORDS
+  // LATEST DATE FIRST
+  // SAME DATE = LATEST ENCODED ROW FIRST
+  // ============================================================
+
+  pastRecords.sort((a, b) => {
+
+    if (b.rawDate !== a.rawDate) {
+      return b.rawDate - a.rawDate;
+    }
+
+    return b.rowIndex - a.rowIndex;
+  });
+
+
+  // ============================================================
+  // SORT TRANSACTIONS
+  // LATEST DATE FIRST
+  // SAME DATE = LATEST ENCODED ROW FIRST
+  // ============================================================
+
+  transactions.sort((a, b) => {
+
+    if (b.rawDate !== a.rawDate) {
+      return b.rawDate - a.rawDate;
+    }
+
+    return b.rowIndex - a.rowIndex;
+  });
+
+
+  return {
+    totals,
+    monthlyOutgoing,
+    transactions,
+    pastRecords
+  };
 }
+
+
 
 /**
  * Appends a NEW outgoing record to the 'Outgoing' sheet
