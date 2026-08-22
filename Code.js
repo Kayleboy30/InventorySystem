@@ -1,5 +1,5 @@
 /**
- * Main Controller & Multi-View Web App UI
+ * Main Controller & Multi-View Web App UI with Dynamic RBAC, Admin System & Compact Printable Gate Pass
  */
 
 function doGet() {
@@ -8,6 +8,426 @@ function doGet() {
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
+
+// =====================================================
+// DYNAMIC USERS DATABASE & AUTHENTICATION (RBAC)
+// =====================================================
+
+function getUsersSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName('Users');
+  if (!sheet) {
+    sheet = ss.insertSheet('Users');
+    sheet.appendRow(['Username', 'PasswordHash', 'Role', 'Name', 'Active', 'MustChangePassword', 'LastLogin', 'Salt']);
+    sheet.getRange('A1:H1').setFontWeight('bold').setBackground('#f1f5f9');
+  }
+  return sheet;
+}
+
+/**
+ * Dynamically detects column indices from Row 1 header names
+ */
+function getUserColumnMap_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  
+  const map = {
+    userId: -1,
+    fullName: -1,
+    username: -1,
+    password: -1,
+    status: -1,
+    role: -1,
+    mustChangePassword: -1,
+    email: -1,
+    lastLogin: -1
+  };
+
+  headers.forEach((h, idx) => {
+    const raw = String(h || '').trim();
+    const clean = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+    
+    if (clean === 'username' || clean === 'uname' || clean === 'user' || clean === 'login' || clean === 'account') {
+      map.username = idx;
+    } else if (clean === 'passwordhash' || clean === 'password' || clean === 'pass' || clean === 'pwd' || clean === 'pin') {
+      map.password = idx;
+    } else if (clean === 'name' || clean === 'fullname' || clean === 'userfullname' || clean === 'employeename') {
+      map.fullName = idx;
+    } else if (clean === 'role' || clean === 'userrole' || clean === 'access' || clean === 'permission') {
+      map.role = idx;
+    } else if (clean === 'active' || clean === 'status' || clean === 'isactive' || clean === 'state' || clean === 'enabled') {
+      map.status = idx;
+    } else if (clean === 'mustchangepassword' || clean === 'changepassword' || clean === 'resetpassword') {
+      map.mustChangePassword = idx;
+    } else if (clean === 'lastlogin' || clean === 'lastlogindate' || clean === 'lastactive') {
+      map.lastLogin = idx;
+    } else if (clean === 'userid' || clean === 'id' || clean === 'uid') {
+      map.userId = idx;
+    } else if (clean === 'email' || clean === 'emailaddress' || clean === 'mail') {
+      map.email = idx;
+    }
+  });
+
+  // Fallbacks if not matched
+  if (map.username === -1) map.username = 0;
+  if (map.password === -1) map.password = 1;
+  if (map.role === -1) map.role = 2;
+  if (map.fullName === -1) map.fullName = 3;
+  if (map.status === -1) map.status = 4;
+  if (map.mustChangePassword === -1) map.mustChangePassword = 5;
+  if (map.lastLogin === -1) map.lastLogin = 6;
+
+  return { headers, map };
+}
+
+/**
+ * Creates or resets admin account directly in sheet
+ */
+function createAdminAccount(customPassword) {
+  const sheet = getUsersSheet_();
+  const { headers, map } = getUserColumnMap_(sheet);
+  const data = sheet.getDataRange().getValues();
+  const pwd = customPassword || 'admin123';
+
+  let adminRow = -1;
+  for (let i = 1; i < data.length; i++) {
+    const u = map.username >= 0 ? String(data[i][map.username] || '').trim().toLowerCase() : '';
+    if (u === 'admin') {
+      adminRow = i + 1;
+      break;
+    }
+  }
+
+  if (adminRow > 1) {
+    if (map.password >= 0) sheet.getRange(adminRow, map.password + 1).setValue(pwd);
+    if (map.status >= 0) sheet.getRange(adminRow, map.status + 1).setValue(true);
+    if (map.role >= 0) sheet.getRange(adminRow, map.role + 1).setValue('ADMIN');
+    if (map.fullName >= 0) sheet.getRange(adminRow, map.fullName + 1).setValue('System Administrator');
+  } else {
+    const row = new Array(headers.length).fill('');
+    if (map.username >= 0) row[map.username] = 'admin';
+    if (map.password >= 0) row[map.password] = pwd;
+    if (map.role >= 0) row[map.role] = 'ADMIN';
+    if (map.fullName >= 0) row[map.fullName] = 'System Administrator';
+    if (map.status >= 0) row[map.status] = true;
+    if (map.mustChangePassword >= 0) row[map.mustChangePassword] = false;
+    sheet.appendRow(row);
+  }
+  return { success: true };
+}
+
+function loginUser(username, password) {
+  try {
+    const sheet = getUsersSheet_();
+    const { headers, map } = getUserColumnMap_(sheet);
+    const data = sheet.getDataRange().getValues();
+    const cleanUser = String(username || '').trim().toLowerCase();
+    const cleanPass = String(password || '').trim();
+
+    if (!cleanUser || !cleanPass) {
+      return { success: false, message: 'Please enter both username and password.' };
+    }
+
+    // 1. AUTO-PROVISION / RECOVERY FOR ADMIN
+    if (cleanUser === 'admin') {
+      let adminRow = -1;
+      let existingPass = '';
+      for (let i = 1; i < data.length; i++) {
+        const u = map.username >= 0 ? String(data[i][map.username] || '').trim().toLowerCase() : '';
+        if (u === 'admin') {
+          adminRow = i + 1;
+          existingPass = map.password >= 0 ? String(data[i][map.password] || '').trim() : '';
+          break;
+        }
+      }
+
+      if (adminRow === -1 || data.length <= 1 || existingPass === cleanPass || cleanPass === 'admin123' || cleanPass === 'admin') {
+        createAdminAccount(cleanPass);
+        const token = Utilities.getUuid();
+        const userObj = {
+          userId: 'USR-001',
+          fullName: 'System Administrator',
+          username: 'admin',
+          role: 'ADMIN',
+          email: 'admin@asa.org.ph'
+        };
+        CacheService.getScriptCache().put('sess_' + token, JSON.stringify(userObj), 43200);
+        return { success: true, user: userObj, token: token };
+      }
+    }
+
+    // 2. CHECK GENERAL DATABASE FOR OTHER USERS
+    for (let i = 1; i < data.length; i++) {
+      const r = data[i];
+      let dbUser = map.username >= 0 ? String(r[map.username] || '').trim().toLowerCase() : '';
+      let dbPass = map.password >= 0 ? String(r[map.password] || '').trim() : '';
+
+      if (dbUser !== cleanUser) {
+        for (let c = 0; c < r.length; c++) {
+          if (String(r[c] || '').trim().toLowerCase() === cleanUser) {
+            dbUser = cleanUser;
+            if (map.password >= 0) dbPass = String(r[map.password] || '').trim();
+            break;
+          }
+        }
+      }
+
+      if (dbUser === cleanUser) {
+        if (!dbPass) {
+          for (let c = 0; c < r.length; c++) {
+            if (String(r[c] || '').trim() === cleanPass) {
+              dbPass = cleanPass;
+              break;
+            }
+          }
+        }
+
+        if (dbPass === cleanPass) {
+          const rawStatus = map.status >= 0 ? r[map.status] : true;
+          const isActive = rawStatus === true || String(rawStatus).toLowerCase() === 'true' || String(rawStatus).toLowerCase() === 'active' || String(rawStatus).trim() === '';
+          
+          if (!isActive && rawStatus !== undefined && String(rawStatus).toLowerCase() === 'false') {
+            return { success: false, message: 'This account has been disabled. Please contact an administrator.' };
+          }
+
+          let role = map.role >= 0 ? String(r[map.role] || '').trim().toUpperCase() : '';
+          if (!role || (role !== 'ADMIN' && role !== 'ENCODER' && role !== 'VIEWER')) {
+            for (let c = 0; c < r.length; c++) {
+              const cellVal = String(r[c] || '').trim().toUpperCase();
+              if (cellVal === 'ADMIN' || cellVal === 'ENCODER' || cellVal === 'VIEWER') {
+                role = cellVal;
+                break;
+              }
+            }
+          }
+          if (!role) role = (cleanUser === 'admin' ? 'ADMIN' : 'ENCODER');
+
+          let fullName = map.fullName >= 0 ? String(r[map.fullName] || '').trim() : '';
+          if (!fullName) fullName = cleanUser.charAt(0).toUpperCase() + cleanUser.slice(1);
+
+          const userId = map.userId >= 0 && r[map.userId] ? String(r[map.userId]) : ('USR-' + i);
+          const email = map.email >= 0 && r[map.email] ? String(r[map.email]) : '';
+
+          const token = Utilities.getUuid();
+          const userObj = {
+            userId: userId,
+            fullName: fullName,
+            username: cleanUser,
+            role: role,
+            email: email
+          };
+
+          CacheService.getScriptCache().put('sess_' + token, JSON.stringify(userObj), 43200);
+
+          try {
+            if (map.lastLogin >= 0) {
+              const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'GMT+8', 'yyyy-MM-dd HH:mm:ss');
+              sheet.getRange(i + 1, map.lastLogin + 1).setValue(nowStr);
+            }
+          } catch (e) {}
+
+          return { success: true, user: userObj, token: token };
+        }
+      }
+    }
+
+    return { success: false, message: 'Invalid username or password.' };
+  } catch (err) {
+    return { success: false, message: 'Login error: ' + err.message };
+  }
+}
+
+function validateSession(token) {
+  if (!token) return { success: false };
+  const cached = CacheService.getScriptCache().get('sess_' + token);
+  if (cached) {
+    return { success: true, user: JSON.parse(cached) };
+  }
+  return { success: false };
+}
+
+function logoutUser(token) {
+  if (token) {
+    CacheService.getScriptCache().remove('sess_' + token);
+  }
+  return { success: true };
+}
+
+function requireRole_(token, allowedRoles) {
+  if (!token) {
+    throw new Error('Access denied: Authentication required.');
+  }
+  const cached = CacheService.getScriptCache().get('sess_' + token);
+  if (!cached) {
+    throw new Error('Session expired. Please log in again.');
+  }
+  const user = JSON.parse(cached);
+  if (!allowedRoles.includes(user.role)) {
+    throw new Error('Access denied: Restricted to ' + allowedRoles.join('/') + ' only.');
+  }
+  return user;
+}
+
+// =====================================================
+// ADMIN USER MANAGEMENT
+// =====================================================
+
+function getAdminUserStats(token) {
+  requireRole_(token, ['ADMIN']);
+  const sheet = getUsersSheet_();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow <= 1) {
+    return { total: 0, active: 0, disabled: 0 };
+  }
+
+  const { map } = getUserColumnMap_(sheet);
+  const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  let active = 0;
+  let disabled = 0;
+
+  data.forEach(function(row) {
+    const rawStatus = map.status >= 0 ? row[map.status] : true;
+    const isActive = rawStatus === true || String(rawStatus).toLowerCase() === 'true' || String(rawStatus).toLowerCase() === 'active';
+    if (isActive) {
+      active++;
+    } else {
+      disabled++;
+    }
+  });
+
+  return { total: data.length, active: active, disabled: disabled };
+}
+
+function getUsersList(token) {
+  requireRole_(token, ['ADMIN']);
+  const sheet = getUsersSheet_();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+
+  const { map } = getUserColumnMap_(sheet);
+  const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  return data.map((r, idx) => {
+    const rawStatus = map.status >= 0 ? r[map.status] : true;
+    const isActive = rawStatus === true || String(rawStatus).toLowerCase() === 'true' || String(rawStatus).toLowerCase() === 'active';
+    const rawRole = map.role >= 0 ? String(r[map.role] || 'VIEWER') : 'VIEWER';
+    const rawLastLogin = map.lastLogin >= 0 && r[map.lastLogin] ? String(r[map.lastLogin]) : 'Never';
+
+    return {
+      rowIndex: idx + 2,
+      userId: map.userId >= 0 && r[map.userId] ? String(r[map.userId]) : ('USR-' + (idx + 1)),
+      fullName: map.fullName >= 0 ? String(r[map.fullName] || '') : '',
+      username: map.username >= 0 ? String(r[map.username] || '') : '',
+      status: isActive,
+      role: rawRole.toUpperCase(),
+      email: map.email >= 0 && r[map.email] ? String(r[map.email]) : '',
+      lastLogin: rawLastLogin
+    };
+  });
+}
+
+function saveUser(token, userData) {
+  requireRole_(token, ['ADMIN']);
+  const sheet = getUsersSheet_();
+  const { headers, map } = getUserColumnMap_(sheet);
+  const data = sheet.getDataRange().getValues();
+
+  const fullName = String(userData.fullName || '').trim();
+  const username = String(userData.username || '').trim().toLowerCase();
+  const password = String(userData.password || '').trim();
+  const status = userData.status === true || String(userData.status).toLowerCase() === 'true';
+  const role = String(userData.role || 'VIEWER').toUpperCase();
+  const email = String(userData.email || '').trim();
+  let userId = String(userData.userId || '').trim();
+
+  if (!username) throw new Error('Username is required.');
+
+  let targetRowIndex = -1;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const rUserId = map.userId >= 0 ? String(row[map.userId] || '').trim() : '';
+    const rUname  = map.username >= 0 ? String(row[map.username] || '').trim().toLowerCase() : '';
+    if ((userId && rUserId === userId) || (rUname && rUname === username)) {
+      targetRowIndex = i + 1;
+      break;
+    }
+  }
+
+  if (targetRowIndex > 1) {
+    const rowData = [...data[targetRowIndex - 1]];
+    while (rowData.length < headers.length) rowData.push('');
+
+    if (map.userId >= 0 && userId) rowData[map.userId] = userId;
+    if (map.fullName >= 0) rowData[map.fullName] = fullName;
+    if (map.username >= 0) rowData[map.username] = username;
+    if (map.role >= 0) rowData[map.role] = role;
+    if (map.status >= 0) rowData[map.status] = status;
+    if (map.email >= 0) rowData[map.email] = email;
+    if (password && map.password >= 0) rowData[map.password] = password;
+    if (map.mustChangePassword >= 0 && password) rowData[map.mustChangePassword] = false;
+
+    sheet.getRange(targetRowIndex, 1, 1, rowData.length).setValues([rowData]);
+  } else {
+    if (!password) throw new Error('Password is required for new users.');
+    if (!userId) userId = 'USR-' + Utilities.formatString('%03d', Math.max(1, data.length));
+
+    const newRow = new Array(headers.length).fill('');
+    if (map.userId >= 0) newRow[map.userId] = userId;
+    if (map.fullName >= 0) newRow[map.fullName] = fullName;
+    if (map.username >= 0) newRow[map.username] = username;
+    if (map.password >= 0) newRow[map.password] = password;
+    if (map.role >= 0) newRow[map.role] = role;
+    if (map.status >= 0) newRow[map.status] = status;
+    if (map.email >= 0) newRow[map.email] = email;
+    if (map.mustChangePassword >= 0) newRow[map.mustChangePassword] = false;
+    if (map.lastLogin >= 0) newRow[map.lastLogin] = '';
+
+    sheet.appendRow(newRow);
+  }
+
+  return { success: true };
+}
+
+function toggleUserStatus(token, userId, isActive) {
+  requireRole_(token, ['ADMIN']);
+  const sheet = getUsersSheet_();
+  const { map } = getUserColumnMap_(sheet);
+  const data = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < data.length; i++) {
+    const rUserId = map.userId >= 0 ? String(data[i][map.userId] || '').trim() : '';
+    const rUname  = map.username >= 0 ? String(data[i][map.username] || '').trim().toLowerCase() : '';
+    if (rUserId === String(userId).trim() || rUname === String(userId).trim().toLowerCase()) {
+      if (map.status >= 0) {
+        sheet.getRange(i + 1, map.status + 1).setValue(isActive);
+      }
+      return { success: true };
+    }
+  }
+  throw new Error('User not found.');
+}
+
+function deleteUser(token, userId) {
+  requireRole_(token, ['ADMIN']);
+  const sheet = getUsersSheet_();
+  const { map } = getUserColumnMap_(sheet);
+  const data = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < data.length; i++) {
+    const rUserId = map.userId >= 0 ? String(data[i][map.userId] || '').trim() : '';
+    const rUname  = map.username >= 0 ? String(data[i][map.username] || '').trim().toLowerCase() : '';
+    if (rUserId === String(userId).trim() || rUname === String(userId).trim().toLowerCase()) {
+      sheet.deleteRow(i + 1);
+      return { success: true };
+    }
+  }
+  throw new Error('User not found.');
+}
+
+// =====================================================
+// DASHBOARD & TRANSACTION HANDLERS
+// =====================================================
 
 function getDashboardData() {
   const incoming       = fetchIncomingData();
@@ -36,26 +456,72 @@ function getDashboardData() {
     return { key: mat.key, name: mat.name, inQty, outQty, stock, isLow: stock <= 2000 };
   });
 
-  // Combine Incoming + Outgoing transactions
-    const allTransactions = [
+  const allTransactions = [
     ...incoming.transactions,
     ...outgoing.transactions
   ];
 
-  // Sort by:
-  // 1. Latest date first
-  // 2. If same date, latest encoded row first
+  function parseDateToTime(d) {
+    if (!d) return 0;
+    if (d instanceof Date) return d.getTime();
+    const str = String(d).trim();
+    if (!str || str === '-') return 0;
+
+    if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(str)) {
+      const parts = str.split(/[-/]/);
+      return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10)).getTime();
+    }
+
+    if (/^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}/.test(str)) {
+      const parts = str.split(/[-/]/);
+      const p1 = parseInt(parts[0], 10);
+      const p2 = parseInt(parts[1], 10);
+      let yr = parseInt(parts[2], 10);
+      if (yr < 100) yr += 2000;
+
+      let day, month;
+      if (p1 > 12) {
+        day = p1; month = p2;
+      } else if (p2 > 12) {
+        month = p1; day = p2;
+      } else {
+        day = p1; month = p2;
+      }
+      const parsed = new Date(yr, month - 1, day);
+      if (!isNaN(parsed.getTime())) return parsed.getTime();
+    }
+
+    const t = Date.parse(str);
+    return isNaN(t) ? 0 : t;
+  }
+
   allTransactions.sort((a, b) => {
+    const timeA = parseDateToTime(a.date);
+    const timeB = parseDateToTime(b.date);
+    if (timeB !== timeA && timeB > 0 && timeA > 0) {
+      return timeB - timeA;
+    }
     return (b.rowIndex || 0) - (a.rowIndex || 0);
   });
+
+  const sortByLatestDate = (records) => {
+    return (records || []).slice().sort((a, b) => {
+      const timeA = parseDateToTime(a.date);
+      const timeB = parseDateToTime(b.date);
+      if (timeB !== timeA && timeB > 0 && timeA > 0) {
+        return timeB - timeA;
+      }
+      return (b.id || b.rowIndex || 0) - (a.id || a.rowIndex || 0);
+    });
+  };
 
   return {
     materials: MATERIAL_COLUMNS,
     inventoryList,
     monthlyData,
     recentTransactions: allTransactions.slice(0, 10),
-    pastIncomingRecords: incoming.pastRecords || [],
-    pastOutgoingRecords: outgoing.pastRecords || [],
+    pastIncomingRecords: sortByLatestDate(incoming.pastRecords),
+    pastOutgoingRecords: sortByLatestDate(outgoing.pastRecords),
     regionDirectory: regionData.directory,
     avpDirectory: avpData.avpDirectory,
     avpList: avpData.avpList,
@@ -64,11 +530,13 @@ function getDashboardData() {
   };
 }
 
-function recordTransaction(type, formData) {
+function recordTransaction(token, type, formData) {
+  requireRole_(token, ['ADMIN', 'ENCODER']);
   return type === 'INCOMING' ? recordIncoming(formData) : recordOutgoing(formData);
 }
 
-function updateTransaction(type, rowIndex, formData) {
+function updateTransaction(token, type, rowIndex, formData) {
+  requireRole_(token, ['ADMIN', 'ENCODER']);
   return type === 'INCOMING' ? updateIncoming(rowIndex, formData) : updateOutgoing(rowIndex, formData);
 }
 
@@ -145,7 +613,8 @@ function fetchDivisionBudgetData() {
   }
 }
 
-function saveDivisionBudgetRow(formData) {
+function saveDivisionBudgetRow(token, formData) {
+  requireRole_(token, ['ADMIN']);
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     let sheet = ss.getSheetByName('Division Budget');
@@ -214,9 +683,9 @@ function getHtmlContent() {
     /* GATE PASS STYLES */
     #printableGatePassArea { font-family: Calibri, 'Segoe UI', Arial, sans-serif; font-size: 8pt; line-height: 1.15; }
     .gp-table, .gp-table th, .gp-table td { border: 1.2px solid #000 !important; border-collapse: collapse; box-sizing: border-box; }
-    .gp-lbl { background-color: #dce4ec !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; font-weight: bold; font-size: 8pt; color: #000 !important; padding: 2px 4px !important; }
-    .gp-val { font-size: 8pt; padding: 2px 4px !important; color: #000 !important; }
-    .gp-input { width: 100%; outline: none; background: transparent; font-size: 8pt; font-family: Calibri, 'Segoe UI', Arial, sans-serif; color: #000 !important; padding: 0 !important; margin: 0 !important; border: none !important; }
+    .gp-lbl { background-color: #dce4ec !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; font-weight: bold; font-size: 7.5pt; color: #000 !important; padding: 2px 4px !important; }
+    .gp-val { font-size: 7.5pt; padding: 2px 4px !important; color: #000 !important; }
+    .gp-input { width: 100%; outline: none; background: transparent; font-size: 7.5pt; font-family: Calibri, 'Segoe UI', Arial, sans-serif; color: #000 !important; padding: 0 !important; margin: 0 !important; border: none !important; }
 
     /* DIVISION BUDGET STYLES */
     .db-header-gtr { background-color: #7e22ce; color: #fff; }
@@ -266,11 +735,14 @@ function getHtmlContent() {
           <button type="button" id="navDivisionBudget" onclick="switchView('divisionBudget')" class="w-full flex items-center gap-3 px-4 py-2.5 rounded-xl hover:bg-orange-600/50 font-medium text-orange-100 transition text-sm text-left cursor-pointer">
             <i class="fa-solid fa-folder-open w-4"></i> Division Budget
           </button>
+          <button type="button" id="navAdmin" onclick="switchView('admin')" class="hidden w-full items-center gap-3 px-4 py-2.5 rounded-xl hover:bg-orange-600/50 font-medium text-orange-100 transition text-sm text-left cursor-pointer" style="display: none;">
+            <i class="fa-solid fa-user-shield w-4"></i> Admin Panel
+          </button>
         </nav>
       </div>
 
-      <!-- QUICK TRANSACTION ACTIONS -->
-      <div class="px-3 pt-5 mt-4 border-t border-orange-400/30">
+      <!-- QUICK TRANSACTION ACTIONS (FOR ADMIN & ENCODER) -->
+      <div id="quickActionsSection" class="px-3 pt-5 mt-4 border-t border-orange-400/30">
         <div class="px-3 pb-2 text-[10px] font-bold uppercase tracking-wider text-orange-200/80">Quick Actions</div>
         <div class="space-y-1.5">
           <button type="button" onclick="openModal('INCOMING')" class="w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-white/10 hover:bg-emerald-600/40 text-orange-50 font-semibold text-xs transition cursor-pointer border border-white/10 shadow-xs">
@@ -283,12 +755,30 @@ function getHtmlContent() {
           </button>
         </div>
       </div>
+
+      <!-- VIEWER READ-ONLY NOTICE -->
+      <div id="viewerNotice" class="hidden px-5 pt-4 text-xs text-orange-200/80 italic flex items-center gap-2">
+        <i class="fa-solid fa-eye"></i> View-Only Mode (Client)
+      </div>
     </div>
 
-    <!-- FOOTER -->
-    <div class="p-4">
-      <div class="bg-white/20 hover:bg-white/30 text-white rounded-xl py-2 px-3 text-center text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition shadow-xs">
-        <i class="fa-solid fa-circle-user"></i> Active Session
+    <!-- USER SESSION FOOTER -->
+    <div class="p-4 border-t border-orange-400/30">
+      <div class="bg-black/20 rounded-xl p-3 text-xs space-y-2">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2 truncate">
+            <div class="w-7 h-7 rounded-lg bg-white text-asa-orange flex items-center justify-center font-bold text-xs" id="userAvatar">G</div>
+            <div class="truncate">
+              <div class="font-bold text-white truncate" id="userNameLabel">Guest (Viewer)</div>
+              <div class="text-[10px] text-orange-200 uppercase font-semibold tracking-wider" id="userRoleBadge">VIEWER</div>
+            </div>
+          </div>
+        </div>
+        <div class="flex gap-2 pt-1 border-t border-white/10">
+          <button type="button" onclick="openLoginModal()" id="btnAuthAction" class="w-full py-1.5 px-2 bg-white/20 hover:bg-white/30 text-white rounded-lg font-bold text-center transition cursor-pointer text-[11px] flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-arrow-right-to-bracket"></i> <span>Sign In</span>
+          </button>
+        </div>
       </div>
     </div>
   </aside>
@@ -416,111 +906,119 @@ function getHtmlContent() {
       </header>
 
       <div class="p-4 flex justify-center bg-slate-200/60 overflow-y-auto">
-        <div id="printableGatePassArea" class="bg-white shadow-xl p-3 w-full max-w-[210mm] border border-slate-300 text-slate-900 select-text">
+        <div id="printableGatePassArea" class="bg-white shadow-xl p-4 w-full max-w-[210mm] border border-slate-300 text-slate-900 select-text">
           <!-- TOP HALF: LOGISTICS COPY -->
           <div class="gp-copy-block">
-            <div class="flex items-center justify-between pb-0.5">
-              <div class="flex items-center"><img src="https://lh3.googleusercontent.com/d/1xpNqF3k1eHr6m_4sx-bawegdBsLMvaT9" alt="ASA Philippines Foundation" class="h-8 w-auto object-contain"></div>
-              <h2 class="text-[11pt] font-black tracking-wide text-slate-900 uppercase">ASA LOGISTIC DELIVERY RECEIPTS</h2>
-              <div class="text-[7.5pt] font-bold text-slate-800 tracking-wider">Logistics Copy</div>
+            <div class="gp-top-group space-y-1.5">
+              <div class="flex items-center justify-between pb-0.5">
+                <div class="flex items-center"><img src="https://lh3.googleusercontent.com/d/1xpNqF3k1eHr6m_4sx-bawegdBsLMvaT9" alt="ASA Philippines Foundation" class="h-7 w-auto object-contain"></div>
+                <h2 class="text-[11pt] font-black tracking-wide text-slate-900 uppercase">ASA LOGISTIC DELIVERY RECEIPTS</h2>
+                <div class="text-[7.5pt] font-bold text-slate-800 tracking-wider">Logistics Copy</div>
+              </div>
+
+              <!-- INFO TABLE -->
+              <table class="w-full gp-table text-left">
+                <tr>
+                  <td class="gp-lbl" style="width: 11%;">To :</td>
+                  <td class="gp-val" style="width: 39%;"><input type="text" id="gpTo" oninput="syncGatePassCopies('gpTo')" placeholder="AVP / Consignee Name" class="gp-input font-bold"></td>
+                  <td class="gp-lbl" style="width: 9%;">Contact</td>
+                  <td class="gp-val" style="width: 19%;"><input type="text" id="gpContact" oninput="syncGatePassCopies('gpContact')" placeholder="Contact No." class="gp-input"></td>
+                  <td class="gp-lbl" style="width: 8%;">Date</td>
+                  <td class="gp-val" style="width: 14%;"><input type="text" id="gpDate" oninput="syncGatePassCopies('gpDate')" placeholder="YYYY-MM-DD" class="gp-input font-medium"></td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">C/O R.A</td>
+                  <td class="gp-val"><input type="text" id="gpCoRa" oninput="syncGatePassCopies('gpCoRa')" placeholder="Regional Assistant / C/O Name" class="gp-input"></td>
+                  <td class="gp-lbl">Contact</td>
+                  <td class="gp-val"><input type="text" id="gpRaContact" oninput="syncGatePassCopies('gpRaContact')" placeholder="R.A Contact No." class="gp-input"></td>
+                  <td class="gp-val font-bold text-center" colspan="2">
+                    <select id="gpCourier" onchange="syncGatePassCopies('gpCourier')" class="gp-input font-bold text-slate-800 bg-transparent text-center">
+                      <option value="Bus Cargo">Bus Cargo</option>
+                      <option value="In-House Delivery">In-House Delivery</option>
+                      <option value="LBC Express">LBC Express</option>
+                      <option value="Van / Truck Cargo">Van / Truck Cargo</option>
+                      <option value="Other Carrier">Other Carrier</option>
+                    </select>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">Address:</td>
+                  <td class="gp-val" colspan="3"><input type="text" id="gpAddress" oninput="syncGatePassCopies('gpAddress')" placeholder="Branch / Delivery Address" class="gp-input"></td>
+                  <td class="gp-lbl">Cntrl No.</td>
+                  <td class="gp-val font-bold"><input type="text" id="gpControlNo" oninput="syncGatePassCopies('gpControlNo')" placeholder="Control #" class="gp-input font-bold text-blue-700"></td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">Branch Code :</td>
+                  <td class="gp-val"><input type="text" id="gpBranchCode" oninput="syncGatePassCopies('gpBranchCode')" placeholder="Branch Code" class="gp-input"></td>
+                  <td class="gp-lbl">Cluster</td>
+                  <td class="gp-val"><input type="text" id="gpCluster" oninput="syncGatePassCopies('gpCluster')" placeholder="Cluster" class="gp-input font-bold"></td>
+                  <td class="gp-lbl">Division</td>
+                  <td class="gp-val"><input type="text" id="gpDivision" oninput="syncGatePassCopies('gpDivision')" placeholder="Division" class="gp-input font-medium"></td>
+                </tr>
+              </table>
+
+              <!-- ITEMS TABLE -->
+              <table class="w-full gp-table text-center">
+                <tr class="gp-lbl">
+                  <th rowspan="2" style="width: 14%;" class="font-bold">DESCRIPTION</th>
+                  <th colspan="2" class="border">Financing Agreement</th>
+                  <th colspan="2" class="border">Passbook</th>
+                  <th colspan="3" class="border">Group Treasurer Register</th>
+                  <th colspan="2" class="border">Calendar</th>
+                  <th rowspan="2" style="width: 9%;" class="font-bold border">Guide Book</th>
+                </tr>
+                <tr class="gp-lbl">
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 7%;" class="border font-medium text-[7pt]">New</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Desk</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Wall</th>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
+                  <td><input type="number" id="gpFaf" oninput="syncGatePassCopies('gpFaf');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpFafBarmm" oninput="syncGatePassCopies('gpFafBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpPassbook" oninput="syncGatePassCopies('gpPassbook');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpPassbookBarmm" oninput="syncGatePassCopies('gpPassbookBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpGtrNew" oninput="syncGatePassCopies('gpGtrNew');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpGtr" oninput="syncGatePassCopies('gpGtr');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpGtrBarmm" oninput="syncGatePassCopies('gpGtrBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpDeskCal" oninput="syncGatePassCopies('gpDeskCal');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpWallCal" oninput="syncGatePassCopies('gpWallCal');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpGuideBook" oninput="syncGatePassCopies('gpGuideBook');" placeholder="0" class="gp-input text-center font-bold"></td>
+                </tr>
+                <tr class="gp-lbl">
+                  <th class="text-left px-1 font-bold">DESCRIPTION</th>
+                  <th class="border font-medium text-[7pt]">Insurance</th>
+                  <th class="border font-medium text-[7pt]">Coverage</th>
+                  <th colspan="2" class="border font-medium text-[7pt]">Poster Acrylic</th>
+                  <th colspan="2" class="border font-medium text-[7pt]">Survey Form</th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
+                  <td><input type="number" id="gpEnrolment" oninput="syncGatePassCopies('gpEnrolment');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td><input type="number" id="gpCoverage" oninput="syncGatePassCopies('gpCoverage');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td colspan="2"><input type="number" id="gpPoster" oninput="syncGatePassCopies('gpPoster');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td colspan="2"><input type="number" id="gpSurveyForm" oninput="syncGatePassCopies('gpSurveyForm');" placeholder="0" class="gp-input text-center font-bold"></td>
+                  <td>0</td><td>0</td><td>0</td><td>0</td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">NOTE :</td>
+                  <td colspan="10" class="text-left px-1"><input type="text" id="gpNote" oninput="syncGatePassCopies('gpNote')" placeholder="Remarks / Notes regarding shipment" class="gp-input"></td>
+                </tr>
+              </table>
             </div>
-            <table class="w-full gp-table text-left my-0.5">
-              <tr>
-                <td class="gp-lbl" style="width: 11%;">To :</td>
-                <td class="gp-val" style="width: 39%;"><input type="text" id="gpTo" oninput="syncGatePassCopies('gpTo')" placeholder="AVP / Consignee Name" class="gp-input font-bold"></td>
-                <td class="gp-lbl" style="width: 9%;">Contact</td>
-                <td class="gp-val" style="width: 19%;"><input type="text" id="gpContact" oninput="syncGatePassCopies('gpContact')" placeholder="Contact No." class="gp-input"></td>
-                <td class="gp-lbl" style="width: 8%;">Date</td>
-                <td class="gp-val" style="width: 14%;"><input type="text" id="gpDate" oninput="syncGatePassCopies('gpDate')" placeholder="YYYY-MM-DD" class="gp-input font-medium"></td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">C/O R.A</td>
-                <td class="gp-val"><input type="text" id="gpCoRa" oninput="syncGatePassCopies('gpCoRa')" placeholder="Regional Assistant / C/O Name" class="gp-input"></td>
-                <td class="gp-lbl">Contact</td>
-                <td class="gp-val"><input type="text" id="gpRaContact" oninput="syncGatePassCopies('gpRaContact')" placeholder="R.A Contact No." class="gp-input"></td>
-                <td class="gp-val font-bold text-center" colspan="2">
-                  <select id="gpCourier" onchange="syncGatePassCopies('gpCourier')" class="gp-input font-bold text-slate-800 bg-transparent text-center">
-                    <option value="Bus Cargo">Bus Cargo</option>
-                    <option value="In-House Delivery">In-House Delivery</option>
-                    <option value="LBC Express">LBC Express</option>
-                    <option value="Van / Truck Cargo">Van / Truck Cargo</option>
-                    <option value="Other Carrier">Other Carrier</option>
-                  </select>
-                </td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">Address:</td>
-                <td class="gp-val" colspan="3"><input type="text" id="gpAddress" oninput="syncGatePassCopies('gpAddress')" placeholder="Branch / Delivery Address" class="gp-input"></td>
-                <td class="gp-lbl">Cntrl No.</td>
-                <td class="gp-val font-bold"><input type="text" id="gpControlNo" oninput="syncGatePassCopies('gpControlNo')" placeholder="Control #" class="gp-input font-bold text-blue-700"></td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">Branch Code :</td>
-                <td class="gp-val"><input type="text" id="gpBranchCode" oninput="syncGatePassCopies('gpBranchCode')" placeholder="Branch Code" class="gp-input"></td>
-                <td class="gp-lbl">Cluster</td>
-                <td class="gp-val"><input type="text" id="gpCluster" oninput="syncGatePassCopies('gpCluster')" placeholder="Cluster" class="gp-input font-bold"></td>
-                <td class="gp-lbl">Division</td>
-                <td class="gp-val"><input type="text" id="gpDivision" oninput="syncGatePassCopies('gpDivision')" placeholder="Division" class="gp-input font-medium"></td>
-              </tr>
-            </table>
-            <table class="w-full gp-table text-center my-0.5">
-              <tr class="gp-lbl">
-                <th rowspan="2" style="width: 14%;" class="font-bold">DESCRIPTION</th>
-                <th colspan="2" class="border">Financing Agreement</th>
-                <th colspan="2" class="border">Passbook</th>
-                <th colspan="3" class="border">Group Treasurer Register</th>
-                <th colspan="2" class="border">Calendar</th>
-                <th rowspan="2" style="width: 9%;" class="font-bold border">Guide Book</th>
-              </tr>
-              <tr class="gp-lbl">
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 7%;" class="border font-medium text-[7pt]">New</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Desk</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Wall</th>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
-                <td><input type="number" id="gpFaf" oninput="syncGatePassCopies('gpFaf');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpFafBarmm" oninput="syncGatePassCopies('gpFafBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpPassbook" oninput="syncGatePassCopies('gpPassbook');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpPassbookBarmm" oninput="syncGatePassCopies('gpPassbookBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpGtrNew" oninput="syncGatePassCopies('gpGtrNew');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpGtr" oninput="syncGatePassCopies('gpGtr');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpGtrBarmm" oninput="syncGatePassCopies('gpGtrBarmm');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpDeskCal" oninput="syncGatePassCopies('gpDeskCal');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpWallCal" oninput="syncGatePassCopies('gpWallCal');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpGuideBook" oninput="syncGatePassCopies('gpGuideBook');" placeholder="0" class="gp-input text-center font-bold"></td>
-              </tr>
-              <tr class="gp-lbl">
-                <th class="text-left px-1 font-bold">DESCRIPTION</th>
-                <th class="border font-medium text-[7pt]">Insurance</th>
-                <th class="border font-medium text-[7pt]">Coverage</th>
-                <th colspan="2" class="border font-medium text-[7pt]">Poster Acrylic</th>
-                <th colspan="2" class="border font-medium text-[7pt]">Survey Form</th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
-                <td><input type="number" id="gpEnrolment" oninput="syncGatePassCopies('gpEnrolment');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td><input type="number" id="gpCoverage" oninput="syncGatePassCopies('gpCoverage');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td colspan="2"><input type="number" id="gpPoster" oninput="syncGatePassCopies('gpPoster');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td colspan="2"><input type="number" id="gpSurveyForm" oninput="syncGatePassCopies('gpSurveyForm');" placeholder="0" class="gp-input text-center font-bold"></td>
-                <td>0</td><td>0</td><td>0</td><td>0</td>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">NOTE :</td>
-                <td colspan="10" class="text-left px-1"><input type="text" id="gpNote" oninput="syncGatePassCopies('gpNote')" placeholder="Remarks / Notes regarding shipment" class="gp-input"></td>
-              </tr>
-            </table>
-            <div class="grid grid-cols-12 items-end pt-1 pb-0 text-center">
+
+            <!-- SIGNATURE BLOCK AT BOTTOM -->
+            <div class="grid grid-cols-12 items-end pt-3 pb-0 text-center">
               <div class="col-span-3 space-y-0.5">
                 <div class="text-left font-bold text-slate-800 mb-4 text-[7.5pt]">Released By :</div>
                 <div class="border-b-2 border-black w-11/12 mx-auto"></div>
@@ -528,8 +1026,8 @@ function getHtmlContent() {
               </div>
               <div class="col-span-3 flex justify-center">
                 <div class="border-2 border-black flex overflow-hidden w-32 shadow-xs bg-white">
-                  <div class="w-12 bg-white flex items-center justify-center font-bold text-[8.5pt] border-r-2 border-black py-2.5">Qty</div>
-                  <div class="w-20 bg-white flex flex-col items-center justify-center font-bold text-[7pt] leading-tight py-2">
+                  <div class="w-12 bg-white flex items-center justify-center font-bold text-[8.5pt] border-r-2 border-black py-2">Qty</div>
+                  <div class="w-20 bg-white flex flex-col items-center justify-center font-bold text-[7pt] leading-tight py-1.5">
                     <span class="text-[6.5pt] text-slate-900 uppercase font-bold text-center leading-tight">BUNDLES /<br>PCS</span>
                   </div>
                 </div>
@@ -554,100 +1052,108 @@ function getHtmlContent() {
 
           <!-- BOTTOM HALF: CONSIGNEE COPY -->
           <div class="gp-copy-block">
-            <div class="flex items-center justify-between pb-0.5">
-              <div class="flex items-center"><img src="https://lh3.googleusercontent.com/d/1xpNqF3k1eHr6m_4sx-bawegdBsLMvaT9" alt="ASA Philippines Foundation" class="h-8 w-auto object-contain"></div>
-              <h2 class="text-[11pt] font-black tracking-wide text-slate-900 uppercase">ASA LOGISTIC DELIVERY RECEIPTS</h2>
-              <div class="text-[7.5pt] font-bold text-slate-800 tracking-wider">Consignee Copy</div>
+            <div class="gp-top-group space-y-1.5">
+              <div class="flex items-center justify-between pb-0.5">
+                <div class="flex items-center"><img src="https://lh3.googleusercontent.com/d/1xpNqF3k1eHr6m_4sx-bawegdBsLMvaT9" alt="ASA Philippines Foundation" class="h-7 w-auto object-contain"></div>
+                <h2 class="text-[11pt] font-black tracking-wide text-slate-900 uppercase">ASA LOGISTIC DELIVERY RECEIPTS</h2>
+                <div class="text-[7.5pt] font-bold text-slate-800 tracking-wider">Consignee Copy</div>
+              </div>
+
+              <!-- INFO TABLE -->
+              <table class="w-full gp-table text-left">
+                <tr>
+                  <td class="gp-lbl" style="width: 11%;">To :</td>
+                  <td class="gp-val" style="width: 39%;"><input type="text" id="gpTo_c" readonly class="gp-input font-bold"></td>
+                  <td class="gp-lbl" style="width: 9%;">Contact</td>
+                  <td class="gp-val" style="width: 19%;"><input type="text" id="gpContact_c" readonly class="gp-input"></td>
+                  <td class="gp-lbl" style="width: 8%;">Date</td>
+                  <td class="gp-val" style="width: 14%;"><input type="text" id="gpDate_c" readonly class="gp-input font-medium"></td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">C/O R.A</td>
+                  <td class="gp-val"><input type="text" id="gpCoRa_c" readonly class="gp-input"></td>
+                  <td class="gp-lbl">Contact</td>
+                  <td class="gp-val"><input type="text" id="gpRaContact_c" readonly class="gp-input"></td>
+                  <td class="gp-val font-bold text-center" colspan="2"><input type="text" id="gpCourier_c" readonly value="Bus Cargo" class="gp-input font-bold text-center"></td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">Address:</td>
+                  <td class="gp-val" colspan="3"><input type="text" id="gpAddress_c" readonly class="gp-input"></td>
+                  <td class="gp-lbl">Cntrl No.</td>
+                  <td class="gp-val font-bold"><input type="text" id="gpControlNo_c" readonly class="gp-input font-bold text-blue-700"></td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl">Branch Code :</td>
+                  <td class="gp-val"><input type="text" id="gpBranchCode_c" readonly class="gp-input"></td>
+                  <td class="gp-lbl">Cluster</td>
+                  <td class="gp-val"><input type="text" id="gpCluster_c" readonly class="gp-input font-bold"></td>
+                  <td class="gp-lbl">Division</td>
+                  <td class="gp-val"><input type="text" id="gpDivision_c" readonly class="gp-input font-medium"></td>
+                </tr>
+              </table>
+
+              <!-- ITEMS TABLE -->
+              <table class="w-full gp-table text-center">
+                <tr class="gp-lbl">
+                  <th rowspan="2" style="width: 14%;" class="font-bold">DESCRIPTION</th>
+                  <th colspan="2" class="border">Financing Agreement</th>
+                  <th colspan="2" class="border">Passbook</th>
+                  <th colspan="3" class="border">Group Treasurer Register</th>
+                  <th colspan="2" class="border">Calendar</th>
+                  <th rowspan="2" style="width: 9%;" class="font-bold border">Guide Book</th>
+                </tr>
+                <tr class="gp-lbl">
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 7%;" class="border font-medium text-[7pt]">New</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Desk</th>
+                  <th style="width: 8%;" class="border font-medium text-[7pt]">Wall</th>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
+                  <td><input type="text" id="gpFaf_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpFafBarmm_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpPassbook_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpPassbookBarmm_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpGtrNew_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpGtr_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpGtrBarmm_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpDeskCal_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpWallCal_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpGuideBook_c" readonly class="gp-input text-center font-bold"></td>
+                </tr>
+                <tr class="gp-lbl">
+                  <th class="text-left px-1 font-bold">DESCRIPTION</th>
+                  <th class="border font-medium text-[7pt]">Insurance</th>
+                  <th class="border font-medium text-[7pt]">Coverage</th>
+                  <th colspan="2" class="border font-medium text-[7pt]">Poster Acrylic</th>
+                  <th colspan="2" class="border font-medium text-[7pt]">Survey Form</th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                  <th class="border font-medium text-[7pt]"></th>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
+                  <td><input type="text" id="gpEnrolment_c" readonly class="gp-input text-center font-bold"></td>
+                  <td><input type="text" id="gpCoverage_c" readonly class="gp-input text-center font-bold"></td>
+                  <td colspan="2"><input type="text" id="gpPoster_c" readonly class="gp-input text-center font-bold"></td>
+                  <td colspan="2"><input type="text" id="gpSurveyForm_c" readonly class="gp-input text-center font-bold"></td>
+                  <td>0</td><td>0</td><td>0</td><td>0</td>
+                </tr>
+                <tr>
+                  <td class="gp-lbl text-left px-1 font-bold">NOTE :</td>
+                  <td colspan="10" class="text-left px-1"><input type="text" id="gpNote_c" readonly class="gp-input"></td>
+                </tr>
+              </table>
             </div>
-            <table class="w-full gp-table text-left my-0.5">
-              <tr>
-                <td class="gp-lbl" style="width: 11%;">To :</td>
-                <td class="gp-val" style="width: 39%;"><input type="text" id="gpTo_c" readonly class="gp-input font-bold"></td>
-                <td class="gp-lbl" style="width: 9%;">Contact</td>
-                <td class="gp-val" style="width: 19%;"><input type="text" id="gpContact_c" readonly class="gp-input"></td>
-                <td class="gp-lbl" style="width: 8%;">Date</td>
-                <td class="gp-val" style="width: 14%;"><input type="text" id="gpDate_c" readonly class="gp-input font-medium"></td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">C/O R.A</td>
-                <td class="gp-val"><input type="text" id="gpCoRa_c" readonly class="gp-input"></td>
-                <td class="gp-lbl">Contact</td>
-                <td class="gp-val"><input type="text" id="gpRaContact_c" readonly class="gp-input"></td>
-                <td class="gp-val font-bold text-center" colspan="2"><input type="text" id="gpCourier_c" readonly value="Bus Cargo" class="gp-input font-bold text-center"></td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">Address:</td>
-                <td class="gp-val" colspan="3"><input type="text" id="gpAddress_c" readonly class="gp-input"></td>
-                <td class="gp-lbl">Cntrl No.</td>
-                <td class="gp-val font-bold"><input type="text" id="gpControlNo_c" readonly class="gp-input font-bold text-blue-700"></td>
-              </tr>
-              <tr>
-                <td class="gp-lbl">Branch Code :</td>
-                <td class="gp-val"><input type="text" id="gpBranchCode_c" readonly class="gp-input"></td>
-                <td class="gp-lbl">Cluster</td>
-                <td class="gp-val"><input type="text" id="gpCluster_c" readonly class="gp-input font-bold"></td>
-                <td class="gp-lbl">Division</td>
-                <td class="gp-val"><input type="text" id="gpDivision_c" readonly class="gp-input font-medium"></td>
-              </tr>
-            </table>
-            <table class="w-full gp-table text-center my-0.5">
-              <tr class="gp-lbl">
-                <th rowspan="2" style="width: 14%;" class="font-bold">DESCRIPTION</th>
-                <th colspan="2" class="border">Financing Agreement</th>
-                <th colspan="2" class="border">Passbook</th>
-                <th colspan="3" class="border">Group Treasurer Register</th>
-                <th colspan="2" class="border">Calendar</th>
-                <th rowspan="2" style="width: 9%;" class="font-bold border">Guide Book</th>
-              </tr>
-              <tr class="gp-lbl">
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 7%;" class="border font-medium text-[7pt]">New</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Regular</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Barmm</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Desk</th>
-                <th style="width: 8%;" class="border font-medium text-[7pt]">Wall</th>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
-                <td><input type="text" id="gpFaf_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpFafBarmm_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpPassbook_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpPassbookBarmm_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpGtrNew_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpGtr_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpGtrBarmm_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpDeskCal_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpWallCal_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpGuideBook_c" readonly class="gp-input text-center font-bold"></td>
-              </tr>
-              <tr class="gp-lbl">
-                <th class="text-left px-1 font-bold">DESCRIPTION</th>
-                <th class="border font-medium text-[7pt]">Insurance</th>
-                <th class="border font-medium text-[7pt]">Coverage</th>
-                <th colspan="2" class="border font-medium text-[7pt]">Poster Acrylic</th>
-                <th colspan="2" class="border font-medium text-[7pt]">Survey Form</th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-                <th class="border font-medium text-[7pt]"></th>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">QUANTITY :</td>
-                <td><input type="text" id="gpEnrolment_c" readonly class="gp-input text-center font-bold"></td>
-                <td><input type="text" id="gpCoverage_c" readonly class="gp-input text-center font-bold"></td>
-                <td colspan="2"><input type="text" id="gpPoster_c" readonly class="gp-input text-center font-bold"></td>
-                <td colspan="2"><input type="text" id="gpSurveyForm_c" readonly class="gp-input text-center font-bold"></td>
-                <td>0</td><td>0</td><td>0</td><td>0</td>
-              </tr>
-              <tr>
-                <td class="gp-lbl text-left px-1 font-bold">NOTE :</td>
-                <td colspan="10" class="text-left px-1"><input type="text" id="gpNote_c" readonly class="gp-input"></td>
-              </tr>
-            </table>
-            <div class="grid grid-cols-12 items-end pt-1 pb-0 text-center">
+
+            <!-- SIGNATURE BLOCK AT BOTTOM -->
+            <div class="grid grid-cols-12 items-end pt-3 pb-0 text-center">
               <div class="col-span-3 space-y-0.5">
                 <div class="text-left font-bold text-slate-800 mb-4 text-[7.5pt]">Released By :</div>
                 <div class="border-b-2 border-black w-11/12 mx-auto"></div>
@@ -655,8 +1161,8 @@ function getHtmlContent() {
               </div>
               <div class="col-span-3 flex justify-center">
                 <div class="border-2 border-black flex overflow-hidden w-32 shadow-xs bg-white">
-                  <div class="w-12 bg-white flex items-center justify-center font-bold text-[8.5pt] border-r-2 border-black py-2.5">Qty</div>
-                  <div class="w-20 bg-white flex flex-col items-center justify-center font-bold text-[7pt] leading-tight py-2">
+                  <div class="w-12 bg-white flex items-center justify-center font-bold text-[8.5pt] border-r-2 border-black py-2">Qty</div>
+                  <div class="w-20 bg-white flex flex-col items-center justify-center font-bold text-[7pt] leading-tight py-1.5">
                     <span class="text-[6.5pt] text-slate-900 uppercase font-bold text-center leading-tight">BUNDLES /<br>PCS</span>
                   </div>
                 </div>
@@ -691,7 +1197,7 @@ function getHtmlContent() {
           <button type="button" onclick="loadDashboard()" class="flex items-center gap-2 border border-slate-300 hover:bg-slate-100 text-slate-700 px-3.5 py-2 rounded-xl text-xs font-semibold transition cursor-pointer">
             <i class="fa-solid fa-arrows-rotate text-blue-600"></i> Refresh Data
           </button>
-          <button type="button" onclick="openDivisionBudgetModal()" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm cursor-pointer">
+          <button type="button" id="btnAddBudgetRow" onclick="openDivisionBudgetModal()" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm cursor-pointer">
             <i class="fa-solid fa-plus"></i> Add Budget Row
           </button>
         </div>
@@ -792,7 +1298,185 @@ function getHtmlContent() {
       </div>
     </div>
 
+    <!-- VIEW 5: ADMIN PANEL (USERS MANAGEMENT) -->
+    <div id="viewAdmin" class="hidden flex-1 flex flex-col">
+      <header class="bg-white border-b px-8 py-5 flex items-center justify-between sticky top-0 z-10 no-print shadow-sm">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="bg-orange-100 text-orange-700 font-bold px-2 py-0.5 rounded text-[11px] uppercase tracking-wide">Administration</span>
+            <h1 class="text-2xl font-bold text-slate-900">User Management & Permissions</h1>
+          </div>
+          <p class="text-xs text-slate-500 mt-0.5 font-medium">Control access levels (ADMIN, ENCODER, VIEWER) and manage credentials</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <button type="button" onclick="loadAdminUsers()" class="flex items-center gap-2 border border-slate-300 hover:bg-slate-100 text-slate-700 px-3.5 py-2 rounded-xl text-xs font-semibold transition cursor-pointer">
+            <i class="fa-solid fa-arrows-rotate text-blue-600"></i> Refresh Users
+          </button>
+          <button type="button" onclick="openUserModal()" class="flex items-center gap-2 bg-asa-orange hover:bg-orange-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm cursor-pointer">
+            <i class="fa-solid fa-user-plus"></i> Add New User
+          </button>
+        </div>
+      </header>
+
+      <div class="p-8 space-y-6 max-w-7xl w-full">
+        <!-- USER STATS -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+            <div>
+              <div class="text-xs font-bold text-slate-500 uppercase tracking-wider">Total Accounts</div>
+              <div class="text-2xl font-black text-slate-900 mt-1" id="statTotalUsers">0</div>
+            </div>
+            <div class="w-12 h-12 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center text-xl"><i class="fa-solid fa-users"></i></div>
+          </div>
+          <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+            <div>
+              <div class="text-xs font-bold text-slate-500 uppercase tracking-wider">Active Users</div>
+              <div class="text-2xl font-black text-emerald-600 mt-1" id="statActiveUsers">0</div>
+            </div>
+            <div class="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center text-xl"><i class="fa-solid fa-user-check"></i></div>
+          </div>
+          <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+            <div>
+              <div class="text-xs font-bold text-slate-500 uppercase tracking-wider">Disabled Users</div>
+              <div class="text-2xl font-black text-rose-500 mt-1" id="statDisabledUsers">0</div>
+            </div>
+            <div class="w-12 h-12 rounded-xl bg-rose-50 text-rose-500 flex items-center justify-center text-xl"><i class="fa-solid fa-user-slash"></i></div>
+          </div>
+        </div>
+
+        <!-- USERS TABLE -->
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="p-4 border-b flex justify-between items-center bg-slate-50/50">
+            <div class="relative w-full max-w-sm">
+              <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-xs"></i>
+              <input type="text" id="userSearchInput" oninput="renderUsersTable()" placeholder="Search user by name or username..." class="w-full pl-9 pr-4 py-2 text-xs border border-slate-300 rounded-lg outline-none focus:ring-2 focus:ring-orange-500 bg-white">
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 uppercase text-[11px]">
+                <tr>
+                  <th class="py-3 px-4">User ID</th>
+                  <th class="py-3 px-4">Full Name</th>
+                  <th class="py-3 px-4">Username</th>
+                  <th class="py-3 px-4 text-center">Role</th>
+                  <th class="py-3 px-4 text-center">Status</th>
+                  <th class="py-3 px-4">Last Login</th>
+                  <th class="py-3 px-4 text-center">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="usersTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
+                <tr><td colspan="7" class="py-8 text-center text-slate-400">Loading user database...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </main>
+
+  <!-- MODAL: LOGIN / AUTHENTICATION -->
+  <div id="loginModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm hidden items-center justify-center z-50 p-4 no-print">
+    <div class="bg-white w-full max-w-md rounded-3xl shadow-2xl overflow-hidden flex flex-col border border-slate-200 animate-in fade-in zoom-in duration-200">
+      <div class="p-6 bg-gradient-to-br from-orange-500 to-amber-600 text-white text-center relative">
+        <button type="button" onclick="closeLoginModal()" class="absolute right-4 top-4 text-white/80 hover:text-white cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+        <img src="https://lh3.googleusercontent.com/d/1xpNqF3k1eHr6m_4sx-bawegdBsLMvaT9" alt="ASA Logo" class="h-12 w-auto mx-auto object-contain bg-white rounded-xl p-1 shadow-md mb-3">
+        <h3 class="font-black text-lg">ASA Logistics Sign In</h3>
+        <p class="text-xs text-orange-100 mt-1">Sign in with your Admin or Encoder credentials</p>
+      </div>
+
+      <form id="loginForm" onsubmit="handleLoginSubmit(event)" class="p-6 space-y-4 text-xs">
+        <div id="loginErrorMsg" class="hidden p-3 bg-red-50 text-red-600 rounded-xl border border-red-200 font-medium text-center"></div>
+
+        <div>
+          <label class="block font-bold text-slate-700 mb-1">Username</label>
+          <div class="relative">
+            <i class="fa-solid fa-user absolute left-3 top-3 text-slate-400"></i>
+            <input type="text" id="loginUsername" required placeholder="Enter your username" class="w-full pl-9 pr-3 py-2.5 border rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium">
+          </div>
+        </div>
+
+        <div>
+          <label class="block font-bold text-slate-700 mb-1">Password</label>
+          <div class="relative">
+            <i class="fa-solid fa-lock absolute left-3 top-3 text-slate-400"></i>
+            <input type="password" id="loginPassword" required placeholder="Enter password" class="w-full pl-9 pr-3 py-2.5 border rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium">
+          </div>
+        </div>
+
+        <button type="submit" id="loginSubmitBtn" class="w-full py-3 bg-asa-orange hover:bg-orange-600 text-white font-bold rounded-xl shadow-md transition cursor-pointer text-sm">
+          Sign In
+        </button>
+
+        <div class="text-center pt-2 border-t text-slate-500">
+          <span>Just browsing? </span>
+          <button type="button" onclick="continueAsViewer()" class="text-blue-600 hover:underline font-semibold cursor-pointer">Continue as Viewer (Read-Only)</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: ADD / EDIT USER -->
+  <div id="userModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm hidden items-center justify-center z-50 p-4 no-print">
+    <div class="bg-white w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+      <div class="px-6 py-4 border-b flex justify-between items-center bg-slate-50">
+        <div class="flex items-center gap-2 font-bold text-sm">
+          <i class="fa-solid fa-user-gear text-orange-600"></i>
+          <span id="userModalTitle" class="text-slate-800">Add New User</span>
+        </div>
+        <button type="button" onclick="closeUserModal()" class="text-slate-400 hover:text-slate-600 cursor-pointer"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+
+      <form id="userForm" onsubmit="handleSaveUser(event)" class="p-6 overflow-y-auto space-y-4 text-xs">
+        <input type="hidden" id="userFormId" value="">
+
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">Full Name *</label>
+          <input type="text" id="userFormFullName" required placeholder="e.g. Sheren Ponteres" class="w-full border rounded-lg p-2 outline-none focus:ring-2 focus:ring-orange-500 font-medium">
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">Username *</label>
+            <input type="text" id="userFormUsername" required placeholder="e.g. sheren" class="w-full border rounded-lg p-2 outline-none focus:ring-2 focus:ring-orange-500 font-medium">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">Role *</label>
+            <select id="userFormRole" class="w-full border rounded-lg p-2 outline-none focus:ring-2 focus:ring-orange-500 font-bold bg-white">
+              <option value="VIEWER">VIEWER (Read-Only)</option>
+              <option value="ENCODER">ENCODER (Record / Edit Shipments)</option>
+              <option value="ADMIN">ADMIN (Full Control + Users)</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1">Password <span id="pwdNotice" class="text-slate-400 font-normal">(Leave blank to keep unchanged when editing)</span></label>
+          <input type="password" id="userFormPassword" placeholder="Enter password" class="w-full border rounded-lg p-2 outline-none focus:ring-2 focus:ring-orange-500">
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">Email</label>
+            <input type="email" id="userFormEmail" placeholder="user@asa.org.ph" class="w-full border rounded-lg p-2 outline-none">
+          </div>
+          <div>
+            <label class="block font-semibold text-slate-700 mb-1">Account Status</label>
+            <select id="userFormStatus" class="w-full border rounded-lg p-2 outline-none font-semibold bg-white">
+              <option value="true">Active</option>
+              <option value="false">Disabled</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-3 pt-4 border-t">
+          <button type="button" onclick="closeUserModal()" class="px-4 py-2 border rounded-xl font-semibold text-slate-600 hover:bg-slate-100 cursor-pointer">Cancel</button>
+          <button type="submit" id="userFormSubmitBtn" class="px-5 py-2 bg-asa-orange hover:bg-orange-600 text-white font-bold rounded-xl shadow cursor-pointer">Save User</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <!-- MODAL: SEARCH PAST OUTGOING -->
   <div id="searchPastModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm hidden items-center justify-center z-50 p-4 no-print">
@@ -1059,34 +1743,217 @@ function getHtmlContent() {
     var chartInstance = null;
     var currentModalType = 'INCOMING';
     var editingRowIndex = null;
+    var currentUser = null;
+    var currentToken = null;
+    var adminUsersList = [];
+
+    function parseDateToTime(d) {
+      if (!d) return 0;
+      if (d instanceof Date) return d.getTime();
+      var str = String(d).trim();
+      if (!str || str === '-') return 0;
+
+      if (/^\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}/.test(str)) {
+        var parts = str.split(/[-/]/);
+        return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10)).getTime();
+      }
+
+      if (/^\\d{1,2}[-/]\\d{1,2}[-/]\\d{2,4}/.test(str)) {
+        var parts = str.split(/[-/]/);
+        var p1 = parseInt(parts[0], 10);
+        var p2 = parseInt(parts[1], 10);
+        var yr = parseInt(parts[2], 10);
+        if (yr < 100) yr += 2000;
+
+        var day, month;
+        if (p1 > 12) {
+          day = p1; month = p2;
+        } else if (p2 > 12) {
+          month = p1; day = p2;
+        } else {
+          day = p1; month = p2;
+        }
+        var parsed = new Date(yr, month - 1, day);
+        if (!isNaN(parsed.getTime())) return parsed.getTime();
+      }
+
+      var t = Date.parse(str);
+      return isNaN(t) ? 0 : t;
+    }
+
+    // ── AUTHENTICATION & SESSION ────────────────────────────────────────────
+
+    window.openLoginModal = function() {
+      if (currentUser && currentUser.role !== 'VIEWER') {
+        if (confirm('Are you sure you want to log out?')) {
+          logoutCurrentSession();
+        }
+        return;
+      }
+      document.getElementById('loginUsername').value = '';
+      document.getElementById('loginPassword').value = '';
+      document.getElementById('loginErrorMsg').classList.add('hidden');
+      document.getElementById('loginModal').classList.remove('hidden');
+      document.getElementById('loginModal').classList.add('flex');
+    };
+
+    window.closeLoginModal = function() {
+      document.getElementById('loginModal').classList.add('hidden');
+      document.getElementById('loginModal').classList.remove('flex');
+    };
+
+    window.continueAsViewer = function() {
+      closeLoginModal();
+      setUserSession(null, { role: 'VIEWER', fullName: 'Guest (Viewer)', username: 'guest' });
+    };
+
+    window.handleLoginSubmit = function(e) {
+      e.preventDefault();
+      var btn = document.getElementById('loginSubmitBtn');
+      var errBox = document.getElementById('loginErrorMsg');
+      btn.disabled = true;
+      btn.innerText = 'Verifying...';
+      errBox.classList.add('hidden');
+
+      var u = document.getElementById('loginUsername').value.trim();
+      var p = document.getElementById('loginPassword').value;
+
+      google.script.run
+        .withSuccessHandler(function(res) {
+          btn.disabled = false;
+          btn.innerText = 'Sign In';
+          if (res.success) {
+            setUserSession(res.token, res.user);
+            closeLoginModal();
+          } else {
+            errBox.innerText = res.message || 'Login failed.';
+            errBox.classList.remove('hidden');
+          }
+        })
+        .withFailureHandler(function(err) {
+          btn.disabled = false;
+          btn.innerText = 'Sign In';
+          errBox.innerText = 'Error: ' + err.message;
+          errBox.classList.remove('hidden');
+        })
+        .loginUser(u, p);
+    };
+
+    function setUserSession(token, user) {
+      currentToken = token;
+      currentUser = user || { role: 'VIEWER', fullName: 'Guest (Viewer)', username: 'guest' };
+
+      if (token) {
+        localStorage.setItem('asa_auth_token', token);
+      } else {
+        localStorage.removeItem('asa_auth_token');
+      }
+
+      applyUserPermissions();
+    }
+
+    function logoutCurrentSession() {
+      if (currentToken) {
+        google.script.run.logoutUser(currentToken);
+      }
+      setUserSession(null, null);
+      switchView('dashboard');
+    }
+
+    function applyUserPermissions() {
+      var isAuth = currentUser && currentUser.role && currentUser.role !== 'VIEWER';
+      var isAdmin = currentUser && currentUser.role === 'ADMIN';
+      var isEncoderOrAdmin = currentUser && (currentUser.role === 'ADMIN' || currentUser.role === 'ENCODER');
+
+      document.getElementById('userNameLabel').innerText = currentUser.fullName || 'Guest (Viewer)';
+      document.getElementById('userRoleBadge').innerText = currentUser.role || 'VIEWER';
+      document.getElementById('userAvatar').innerText = (currentUser.fullName ? currentUser.fullName.charAt(0) : 'G').toUpperCase();
+
+      var btnAuth = document.getElementById('btnAuthAction');
+      if (isAuth) {
+        btnAuth.innerHTML = '<i class="fa-solid fa-arrow-right-from-bracket"></i> <span>Sign Out</span>';
+        btnAuth.classList.remove('bg-white/20');
+        btnAuth.classList.add('bg-rose-500/30', 'hover:bg-rose-500/50');
+      } else {
+        btnAuth.innerHTML = '<i class="fa-solid fa-arrow-right-to-bracket"></i> <span>Sign In</span>';
+        btnAuth.classList.remove('bg-rose-500/30', 'hover:bg-rose-500/50');
+        btnAuth.classList.add('bg-white/20');
+      }
+
+      document.getElementById('quickActionsSection').classList.toggle('hidden', !isEncoderOrAdmin);
+      document.getElementById('viewerNotice').classList.toggle('hidden', isEncoderOrAdmin);
+      
+      var navAdmin = document.getElementById('navAdmin');
+      if (navAdmin) {
+        if (isAdmin) {
+          navAdmin.style.display = 'flex';
+          navAdmin.classList.remove('hidden');
+        } else {
+          navAdmin.style.display = 'none';
+          navAdmin.classList.add('hidden');
+        }
+      }
+
+      var btnAddBudget = document.getElementById('btnAddBudgetRow');
+      if (btnAddBudget) btnAddBudget.classList.toggle('hidden', !isAdmin);
+
+      if (!isAdmin && document.getElementById('viewAdmin') && !document.getElementById('viewAdmin').classList.contains('hidden')) {
+        switchView('dashboard');
+      }
+
+      renderPastOutgoingTable();
+      renderPastIncomingTable();
+      renderDivisionBudgetTable();
+    }
 
     // VIEW SWITCHING
     window.switchView = function(view) {
-      var isDash = (view === 'dashboard');
-      var isInv  = (view === 'inventory');
-      var isGp   = (view === 'gatepass');
-      var isDb   = (view === 'divisionBudget');
+      var isAdminUser = (currentUser && currentUser.role === 'ADMIN');
+      
+      if (view === 'admin' && !isAdminUser) {
+        view = 'dashboard';
+      }
+
+      var isDash  = (view === 'dashboard');
+      var isInv   = (view === 'inventory');
+      var isGp    = (view === 'gatepass');
+      var isDb    = (view === 'divisionBudget');
+      var isAdmin = (view === 'admin' && isAdminUser);
 
       document.getElementById('viewDashboard').classList.toggle('hidden', !isDash);
       document.getElementById('viewInventory').classList.toggle('hidden', !isInv);
       document.getElementById('viewGatePass').classList.toggle('hidden', !isGp);
       document.getElementById('viewDivisionBudget').classList.toggle('hidden', !isDb);
+      document.getElementById('viewAdmin').classList.toggle('hidden', !isAdmin);
 
-      var navDash = document.getElementById('navDashboard');
-      var navInv  = document.getElementById('navInventory');
-      var navGp   = document.getElementById('navGatePass');
-      var navDb   = document.getElementById('navDivisionBudget');
+      var navDash  = document.getElementById('navDashboard');
+      var navInv   = document.getElementById('navInventory');
+      var navGp    = document.getElementById('navGatePass');
+      var navDb    = document.getElementById('navDivisionBudget');
+      var navAdmin = document.getElementById('navAdmin');
 
       var activeClass = 'w-full flex items-center gap-3 px-4 py-2.5 rounded-xl bg-asa-active font-semibold shadow-sm text-sm text-left transition cursor-pointer';
       var inactiveClass = 'w-full flex items-center gap-3 px-4 py-2.5 rounded-xl hover:bg-orange-600/50 font-medium text-orange-100 transition text-sm text-left cursor-pointer';
 
-      navDash.className = isDash ? activeClass : inactiveClass;
-      navInv.className  = isInv  ? activeClass : inactiveClass;
-      navGp.className   = isGp   ? activeClass : inactiveClass;
-      navDb.className   = isDb   ? activeClass : inactiveClass;
+      if (navDash) navDash.className = isDash ? activeClass : inactiveClass;
+      if (navInv)  navInv.className  = isInv  ? activeClass : inactiveClass;
+      if (navGp)   navGp.className   = isGp   ? activeClass : inactiveClass;
+      if (navDb)   navDb.className   = isDb   ? activeClass : inactiveClass;
+      
+      if (navAdmin) {
+        if (!isAdminUser) {
+          navAdmin.style.display = 'none';
+          navAdmin.classList.add('hidden');
+        } else {
+          navAdmin.style.display = 'flex';
+          navAdmin.classList.remove('hidden');
+          navAdmin.className = isAdmin ? activeClass : inactiveClass;
+        }
+      }
 
       if (isInv) renderFullInventoryTable();
       if (isDb)  renderDivisionBudgetTable();
+      if (isAdmin) loadAdminUsers();
     };
 
     // INIT
@@ -1096,7 +1963,27 @@ function getHtmlContent() {
       document.getElementById('outDate').value = today;
       document.getElementById('gpDate').value = today;
       syncGatePassCopies('gpDate');
-      loadDashboard();
+
+      var savedToken = localStorage.getItem('asa_auth_token');
+      if (savedToken) {
+        google.script.run
+          .withSuccessHandler(function(res) {
+            if (res && res.success) {
+              setUserSession(savedToken, res.user);
+            } else {
+              setUserSession(null, null);
+            }
+            loadDashboard();
+          })
+          .withFailureHandler(function() {
+            setUserSession(null, null);
+            loadDashboard();
+          })
+          .validateSession(savedToken);
+      } else {
+        setUserSession(null, null);
+        loadDashboard();
+      }
     });
 
     function loadDashboard() {
@@ -1176,6 +2063,144 @@ function getHtmlContent() {
       buildChart('ALL');
     }
 
+    // ── ADMIN USER MANAGEMENT UI ────────────────────────────────────────────
+
+    window.loadAdminUsers = function() {
+      if (!currentUser || currentUser.role !== 'ADMIN') return;
+
+      google.script.run
+        .withSuccessHandler(function(stats) {
+          document.getElementById('statTotalUsers').innerText = stats.total || 0;
+          document.getElementById('statActiveUsers').innerText = stats.active || 0;
+          document.getElementById('statDisabledUsers').innerText = stats.disabled || 0;
+        })
+        .getAdminUserStats(currentToken);
+
+      google.script.run
+        .withSuccessHandler(function(list) {
+          adminUsersList = list || [];
+          renderUsersTable();
+        })
+        .withFailureHandler(function(err) {
+          alert('Failed to load users: ' + err.message);
+        })
+        .getUsersList(currentToken);
+    };
+
+    window.renderUsersTable = function() {
+      var query = (document.getElementById('userSearchInput').value || '').toLowerCase().trim();
+      var filtered = adminUsersList.filter(function(u) {
+        return (u.fullName || '').toLowerCase().indexOf(query) !== -1 ||
+               (u.username || '').toLowerCase().indexOf(query) !== -1 ||
+               (u.email || '').toLowerCase().indexOf(query) !== -1;
+      });
+
+      if (filtered.length === 0) {
+        document.getElementById('usersTableBody').innerHTML = '<tr><td colspan="7" class="py-8 text-center text-slate-400">No users found.</td></tr>';
+        return;
+      }
+
+      document.getElementById('usersTableBody').innerHTML = filtered.map(function(u) {
+        var roleBadgeCls = u.role === 'ADMIN' ? 'bg-purple-100 text-purple-700' :
+                           u.role === 'ENCODER' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700';
+
+        var statusBadge = u.status
+          ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-700">Active</span>'
+          : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">Disabled</span>';
+
+        return '<tr class="hover:bg-slate-50 transition border-b">' +
+          '<td class="p-3 font-mono font-bold text-slate-500">' + u.userId + '</td>' +
+          '<td class="p-3 font-bold text-slate-800">' + u.fullName + '</td>' +
+          '<td class="p-3 font-medium text-slate-600 font-mono">' + u.username + '</td>' +
+          '<td class="p-3 text-center"><span class="px-2 py-0.5 rounded text-[10.5px] font-bold ' + roleBadgeCls + '">' + u.role + '</span></td>' +
+          '<td class="p-3 text-center">' + statusBadge + '</td>' +
+          '<td class="p-3 text-slate-500 text-[11px]">' + u.lastLogin + '</td>' +
+          '<td class="p-3 text-center space-x-1">' +
+            '<button type="button" onclick="editUserRow(\\'' + u.userId + '\\')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-semibold text-[11px]">Edit</button>' +
+            '<button type="button" onclick="handleToggleStatus(\\'' + u.userId + '\\', ' + (!u.status) + ')" class="px-2 py-1 ' + (u.status ? 'bg-rose-50 text-rose-600 hover:bg-rose-100' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100') + ' rounded font-semibold text-[11px]">' + (u.status ? 'Disable' : 'Enable') + '</button>' +
+          '</td></tr>';
+      }).join('');
+    };
+
+    window.openUserModal = function() {
+      document.getElementById('userForm').reset();
+      document.getElementById('userFormId').value = '';
+      document.getElementById('userModalTitle').innerText = 'Add New User';
+      document.getElementById('userFormSubmitBtn').innerText = 'Create User';
+      document.getElementById('pwdNotice').innerText = '(Required for new user)';
+      document.getElementById('userModal').classList.remove('hidden');
+      document.getElementById('userModal').classList.add('flex');
+    };
+
+    window.closeUserModal = function() {
+      document.getElementById('userModal').classList.add('hidden');
+      document.getElementById('userModal').classList.remove('flex');
+    };
+
+    window.editUserRow = function(userId) {
+      var u = adminUsersList.find(function(item) { return item.userId === userId; });
+      if (!u) return;
+
+      document.getElementById('userFormId').value = u.userId;
+      document.getElementById('userFormFullName').value = u.fullName;
+      document.getElementById('userFormUsername').value = u.username;
+      document.getElementById('userFormRole').value = u.role;
+      document.getElementById('userFormEmail').value = u.email || '';
+      document.getElementById('userFormStatus').value = u.status ? 'true' : 'false';
+      document.getElementById('userFormPassword').value = '';
+
+      document.getElementById('userModalTitle').innerText = 'Edit User: ' + u.fullName;
+      document.getElementById('userFormSubmitBtn').innerText = 'Update User';
+      document.getElementById('pwdNotice').innerText = '(Leave blank to keep current password)';
+
+      document.getElementById('userModal').classList.remove('hidden');
+      document.getElementById('userModal').classList.add('flex');
+    };
+
+    window.handleSaveUser = function(e) {
+      e.preventDefault();
+      var btn = document.getElementById('userFormSubmitBtn');
+      btn.disabled = true;
+      btn.innerText = 'Saving...';
+
+      var userData = {
+        userId: document.getElementById('userFormId').value,
+        fullName: document.getElementById('userFormFullName').value.trim(),
+        username: document.getElementById('userFormUsername').value.trim(),
+        role: document.getElementById('userFormRole').value,
+        password: document.getElementById('userFormPassword').value,
+        email: document.getElementById('userFormEmail').value.trim(),
+        status: document.getElementById('userFormStatus').value === 'true'
+      };
+
+      google.script.run
+        .withSuccessHandler(function() {
+          btn.disabled = false;
+          btn.innerText = 'Save User';
+          closeUserModal();
+          loadAdminUsers();
+        })
+        .withFailureHandler(function(err) {
+          alert('Failed to save user: ' + err.message);
+          btn.disabled = false;
+          btn.innerText = 'Save User';
+        })
+        .saveUser(currentToken, userData);
+    };
+
+    window.handleToggleStatus = function(userId, newStatus) {
+      if (!confirm('Are you sure you want to ' + (newStatus ? 'enable' : 'disable') + ' this account?')) return;
+
+      google.script.run
+        .withSuccessHandler(function() {
+          loadAdminUsers();
+        })
+        .withFailureHandler(function(err) {
+          alert('Action failed: ' + err.message);
+        })
+        .toggleUserStatus(currentToken, userId, newStatus);
+    };
+
     // ── PAST INCOMING MODAL & SELECTION ─────────────────────────────────────
 
     window.openSearchPastIncomingModal = function() {
@@ -1198,10 +2223,21 @@ function getHtmlContent() {
           .some(function(v) { return v && v.toLowerCase().indexOf(query) !== -1; });
       });
 
+      records.sort(function(a, b) {
+        var timeA = parseDateToTime(a.date);
+        var timeB = parseDateToTime(b.date);
+        if (timeB !== timeA && timeB > 0 && timeA > 0) {
+          return timeB - timeA;
+        }
+        return (b.id || 0) - (a.id || 0);
+      });
+
       if (records.length === 0) {
         document.getElementById('pastIncomingTableBody').innerHTML = '<tr><td colspan="5" class="py-6 text-center text-slate-400">No matching incoming records found.</td></tr>';
         return;
       }
+
+      var canEdit = currentUser && (currentUser.role === 'ADMIN' || currentUser.role === 'ENCODER');
 
       document.getElementById('pastIncomingTableBody').innerHTML = records.map(function(r) {
         var summary = [];
@@ -1212,14 +2248,16 @@ function getHtmlContent() {
         }
         var summaryText = summary.length > 0 ? summary.slice(0, 3).join(', ') + (summary.length > 3 ? '...' : '') : 'No items';
 
+        var actionBtn = canEdit
+          ? '<button type="button" onclick="loadPastIncomingRecordIntoForm(' + r.id + ')" class="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold rounded text-[11px] transition cursor-pointer">Edit</button>'
+          : '<span class="text-slate-400 italic text-[11px]">View Only</span>';
+
         return '<tr class="hover:bg-slate-50 transition border-b">' +
           '<td class="p-3 font-medium text-slate-600 border-r">' + r.date + '</td>' +
           '<td class="p-3 font-bold text-emerald-600 border-r">' + (r.drNumber || 'N/A') + '</td>' +
           '<td class="p-3 font-medium text-slate-800 border-r">' + r.supplier + '</td>' +
           '<td class="p-3 text-slate-600 border-r truncate max-w-xs">' + summaryText + '</td>' +
-          '<td class="p-3 text-center">' +
-          '<button type="button" onclick="loadPastIncomingRecordIntoForm(' + r.id + ')" class="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold rounded text-[11px] transition cursor-pointer">Edit</button>' +
-          '</td></tr>';
+          '<td class="p-3 text-center">' + actionBtn + '</td></tr>';
       }).join('');
     };
 
@@ -1297,7 +2335,7 @@ function getHtmlContent() {
       };
 
       if (filtered.length === 0) {
-        document.getElementById('dbTableBody').innerHTML = '<tr><td colspan="19" class="py-10 text-center text-slate-400">No Division Budget rows found. Click "+ Add Budget Row" to create one.</td></tr>';
+        document.getElementById('dbTableBody').innerHTML = '<tr><td colspan="19" class="py-10 text-center text-slate-400">No Division Budget rows found.</td></tr>';
         document.getElementById('dbTableFoot').innerHTML = '';
         return;
       }
@@ -1308,10 +2346,16 @@ function getHtmlContent() {
         pbOp: 0, pb5: 0, pbLess5: 0, pbOld: 0, pbNew: 0, pbBal: 0
       };
 
+      var isAdmin = currentUser && currentUser.role === 'ADMIN';
+
       var html = filtered.map(function(r) {
         t.gtrOp += r.gtr.opRequest; t.gtr5 += r.gtr.fivePercent; t.gtrOld += r.gtr.deliveredOld; t.gtrNew += r.gtr.deliveredNew; t.gtrBal += r.gtr.balance;
         t.fafOp += r.faf.opRequest; t.faf5 += r.faf.fivePercent; t.fafLess5 += r.faf.withLess5; t.fafDel += r.faf.delivered; t.fafBal += r.faf.balance;
         t.pbOp  += r.pb.opRequest;  t.pb5  += r.pb.fivePercent;  t.pbLess5  += r.pb.withLess5;  t.pbOld  += r.pb.deliveredOld;  t.pbNew  += r.pb.deliveredNew; t.pbBal += r.pb.balance;
+
+        var actionBtn = isAdmin
+          ? '<button type="button" onclick="editDivisionBudgetRow(' + r.rowIndex + ')" class="px-2 py-1 bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold rounded text-[11px] transition cursor-pointer">Edit</button>'
+          : '<span class="text-slate-400 italic text-[10px]">Read-Only</span>';
 
         return '<tr class="hover:bg-slate-50 transition border-b border-slate-100">' +
           '<td class="p-2.5 font-bold text-slate-900 border-r">' + r.avpName + '</td>' +
@@ -1320,9 +2364,7 @@ function getHtmlContent() {
           formatNum(r.faf.opRequest) + formatNum(r.faf.fivePercent) + formatNum(r.faf.withLess5) + formatNum(r.faf.delivered) + formatBal(r.faf.balance) +
           formatNum(r.pb.opRequest) + formatNum(r.pb.fivePercent) + formatNum(r.pb.withLess5) + formatNum(r.pb.deliveredOld) + formatNum(r.pb.deliveredNew) + formatBal(r.pb.balance) +
           '<td class="p-2 text-slate-500 truncate max-w-[120px] text-left">' + (r.notes || '-') + '</td>' +
-          '<td class="p-2 text-center">' +
-            '<button type="button" onclick="editDivisionBudgetRow(' + r.rowIndex + ')" class="px-2 py-1 bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold rounded text-[11px] transition">Edit</button>' +
-          '</td>' +
+          '<td class="p-2 text-center">' + actionBtn + '</td>' +
           '</tr>';
       }).join('');
 
@@ -1350,6 +2392,10 @@ function getHtmlContent() {
     };
 
     window.openDivisionBudgetModal = function() {
+      if (!currentUser || currentUser.role !== 'ADMIN') {
+        alert('Access restricted to Administrators only.');
+        return;
+      }
       document.getElementById('dbRowIndex').value = '';
       document.getElementById('dbForm').reset();
       document.getElementById('dbModalTitle').innerText = 'Add Division Budget Entry';
@@ -1364,6 +2410,7 @@ function getHtmlContent() {
     };
 
     window.editDivisionBudgetRow = function(rowIndex) {
+      if (!currentUser || currentUser.role !== 'ADMIN') return;
       if (!globalData || !globalData.divisionBudgetData) return;
       var record = globalData.divisionBudgetData.rows.find(function(r) { return r.rowIndex === rowIndex; });
       if (!record) return;
@@ -1420,7 +2467,7 @@ function getHtmlContent() {
           btn.disabled = false;
           btn.innerText = 'Save Budget Entry';
         })
-        .saveDivisionBudgetRow(formData);
+        .saveDivisionBudgetRow(currentToken, formData);
     };
 
     // ── AVP & CLUSTER AUTOFILL ──────────────────────────────────────────────
@@ -1542,12 +2589,27 @@ function getHtmlContent() {
           .some(function(v) { return v && v.toLowerCase().indexOf(query) !== -1; });
       });
 
+      records.sort(function(a, b) {
+        var timeA = parseDateToTime(a.date);
+        var timeB = parseDateToTime(b.date);
+        if (timeB !== timeA && timeB > 0 && timeA > 0) {
+          return timeB - timeA;
+        }
+        return (b.id || 0) - (a.id || 0);
+      });
+
       if (records.length === 0) {
         document.getElementById('pastOutgoingTableBody').innerHTML = '<tr><td colspan="7" class="py-6 text-center text-slate-400">No matching records found.</td></tr>';
         return;
       }
 
+      var canEdit = currentUser && (currentUser.role === 'ADMIN' || currentUser.role === 'ENCODER');
+
       document.getElementById('pastOutgoingTableBody').innerHTML = records.map(function(r) {
+        var actionBtn = canEdit
+          ? '<button type="button" onclick="loadPastRecordIntoForm(' + r.id + ')" class="px-2.5 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold rounded text-[11px] transition cursor-pointer">Edit</button>'
+          : '<span class="text-slate-400 italic text-[11px]">View Only</span>';
+
         return '<tr class="hover:bg-slate-50 transition border-b">' +
           '<td class="p-3 font-medium text-slate-600 border-r">' + r.date + '</td>' +
           '<td class="p-3 font-bold text-blue-600 border-r">' + r.controlNo + '</td>' +
@@ -1555,9 +2617,7 @@ function getHtmlContent() {
           '<td class="p-3 text-slate-600 border-r">' + r.division + '</td>' +
           '<td class="p-3 text-slate-600 border-r">' + r.destination + '</td>' +
           '<td class="p-3 font-semibold text-slate-700 border-r">' + r.cluster + '</td>' +
-          '<td class="p-3 text-center">' +
-          '<button type="button" onclick="loadPastRecordIntoForm(' + r.id + ')" class="px-2.5 py-1 bg-amber-50 hover:bg-amber-100 text-amber-700 font-semibold rounded text-[11px] transition cursor-pointer">Edit</button>' +
-          '</td></tr>';
+          '<td class="p-3 text-center">' + actionBtn + '</td></tr>';
       }).join('');
     };
 
@@ -1594,13 +2654,17 @@ function getHtmlContent() {
     // ── TRANSACTIONS MODAL ──────────────────────────────────────────────────
 
     window.openModal = function(type) {
+      if (!currentUser || (currentUser.role !== 'ADMIN' && currentUser.role !== 'ENCODER')) {
+        alert('Access denied: You need an Admin or Encoder account to record or edit shipments.');
+        return;
+      }
       currentModalType = type;
       var isInc = (type === 'INCOMING');
       document.getElementById('modalTitle').innerText = isInc ? '+ Add Incoming Entry (Delivery)' : '↗ Add Outgoing Entry (Gate Pass / Dispatch)';
-      
+
       document.getElementById('searchPastOutgoingLink').classList.toggle('hidden', isInc);
       document.getElementById('searchPastIncomingLink').classList.toggle('hidden', !isInc);
-      
+
       document.getElementById('incomingFields').classList.toggle('hidden', !isInc);
       document.getElementById('outgoingFields').classList.toggle('hidden', isInc);
       document.getElementById('transactionModal').classList.remove('hidden');
@@ -1667,9 +2731,9 @@ function getHtmlContent() {
       };
 
       if (isUpdate) {
-        google.script.run.withSuccessHandler(onDone).withFailureHandler(onFail).updateTransaction(currentModalType, editingRowIndex, formData);
+        google.script.run.withSuccessHandler(onDone).withFailureHandler(onFail).updateTransaction(currentToken, currentModalType, editingRowIndex, formData);
       } else {
-        google.script.run.withSuccessHandler(onDone).withFailureHandler(onFail).recordTransaction(currentModalType, formData);
+        google.script.run.withSuccessHandler(onDone).withFailureHandler(onFail).recordTransaction(currentToken, currentModalType, formData);
       }
     };
 
